@@ -51,6 +51,7 @@ from .jit_config import Sm120JitConfig
 from .moe_utils import spin_wait
 from .token_comm import Sm120SysmemTokenInPullTokenBackPush
 from src.token_comm import (
+    CombineFormat,
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenSrcMetadata,
 )
@@ -187,6 +188,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         comm_backend: Literal["p2p_direct", "nvshmem_ibgda"],
         ibgda_dispatch_chunk_tokens: int,
         fc2_output_dtype: Type[cutlass.Numeric],
+        combine_format: CombineFormat,
         token_back_mode: Literal[
             "epi_warps", "reuse_dispatch_warps"
         ] = "epi_warps",
@@ -219,6 +221,15 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             raise ValueError(
                 "comm_backend must be p2p_direct or nvshmem_ibgda, got "
                 f"{comm_backend!r}."
+            )
+        if fc2_output_dtype is not cutlass.BFloat16:
+            raise ValueError("SM120 Split-MegaMoE FC2 semantics must remain BF16")
+        if combine_format.is_quantized and (
+            comm_backend != "p2p_direct" or token_back_mode != "epi_warps"
+        ):
+            raise NotImplementedError(
+                "quantized combine currently supports p2p_direct with "
+                "token_back_mode='epi_warps' only"
             )
         if dispatch_warps not in (1, 2, 4):
             raise ValueError(
@@ -287,6 +298,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             )
         token_back_by_dispatch = token_back_mode != "epi_warps"
 
+        self.combine_format = combine_format
         super().__init__(
             mma_tiler_mnk=mma_tiler_mnk,
             cluster_shape_mnk=cluster_shape_mnk,
@@ -1113,7 +1125,10 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         fc1_norm_const: cute.Tensor,
         # Combine destination (peer write target under S3; local fc2
         # output region under S2 -- same memory, same caller).
-        combine_output: cute.Tensor,       # (T, num_topk, hidden) BF16
+        # BF16: logical/physical (T, num_topk, hidden). NVFP4: logical hidden,
+        # physically packed as (T, num_topk, hidden / 2) bytes.
+        combine_output: cute.Tensor,
+        combine_sf: Optional[cute.Tensor], # NVFP4 (T, num_topk, hidden / 16) BF16 amax
         combine_ready_flags: Optional[cute.Tensor],
         fc2_block_done_counter: Optional[cute.Tensor],
         # Opaque workspaces.
@@ -1140,7 +1155,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
           * ``fc1_weight`` / ``fc1_weight_sf`` / ``fc2_weight`` /
             ``fc2_weight_sf`` are local-only.
           * ``combine_output`` is the per-rank S3 combine STG target;
-            under S2 it acts as the rank's local BF16 fc2 output.
+            under S2 it acts as the rank's local fc2 output. Quantized
+            combine additionally requires the symmetric ``combine_sf`` plane.
             Placement: sym heap (peer write target) or local in the
             single-rank degenerate case.
 
@@ -1282,9 +1298,15 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
                 local_workspace,
                 self._local_offsets["fc2_output_workspace"],
                 cutlass.Uint8,
-                (pool_token_capacity * self.hidden * (
-                    int(self.fc2_output_dtype.width) // 8
-                ),),
+                (
+                    (
+                        pool_token_capacity
+                        * self.hidden
+                        * int(self.fc2_output_dtype.width)
+                        + 7
+                    )
+                    // 8,
+                ),
                 None,
                 self._local_region_by_name["fc2_output_workspace"].align,
             )
@@ -1298,7 +1320,12 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             fc2_output_workspace_native = None
             fc2_output_workspace_u8 = None
             fc2_done_counter = None
-            combine_output_u8 = combine_output
+            if cutlass.const_expr(self.combine_format.is_quantized):
+                combine_output_u8 = cute.recast_tensor(
+                    combine_output, cutlass.Uint8
+                )
+            else:
+                combine_output_u8 = combine_output
 
         if cutlass.const_expr(self.comm_backend == "nvshmem_ibgda"):
             ibgda_sf_staging = self._view_local(
@@ -1306,6 +1333,11 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             )
         else:
             ibgda_sf_staging = None
+
+        if cutlass.const_expr(self.combine_format.is_quantized):
+            token_comm_combine_sf = combine_sf
+        else:
+            token_comm_combine_sf = ibgda_sf_staging
 
         if cutlass.const_expr(self.token_back_schedule_mode == "atomic_counter"):
             token_back_schedule_counter = self._view_local(
@@ -1329,7 +1361,7 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             fc1_ready_counter=l1_arrival_count,
             token_src_metadata=token_src_metadata,
             combine_output=combine_output_u8,
-            combine_sf=ibgda_sf_staging,
+            combine_sf=token_comm_combine_sf,
             fc2_output_workspace=fc2_output_workspace_u8,
             fc2_output_sf=None,
             fc2_done_counter=fc2_done_counter,
@@ -1363,6 +1395,17 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         # source rank's token row through ``token_comm_args``.
         if cutlass.const_expr(self.token_back_by_dispatch):
             fc2_output_target = fc2_output_workspace_native
+        elif cutlass.const_expr(self.combine_format.is_quantized):
+            # K1 and K2 share a BF16-semantic FC12 base. K1 still traces its
+            # unreachable FC2 branch, so present a BF16-typed logical view;
+            # quantized K2 bypasses this view and writes the wire planes from
+            # ``token_comm_args`` explicitly.
+            fc2_output_target = cute.make_tensor(
+                cute.recast_ptr(
+                    combine_output.iterator, dtype=cutlass.BFloat16
+                ),
+                combine_output.layout,
+            )
         else:
             fc2_output_target = combine_output
 

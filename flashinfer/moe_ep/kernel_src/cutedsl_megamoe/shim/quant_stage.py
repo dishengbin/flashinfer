@@ -78,15 +78,23 @@ def staged_tokens(topk_idx_out: torch.Tensor) -> Optional[int]:
 
 
 def forget_staged_tokens(topk_idx_out: torch.Tensor) -> None:
-    """Evict a buffer from the staging memos at workspace teardown.
+    """Evict a buffer and its launch descriptors at workspace teardown.
 
     The symmetric heap (and the caching allocator) reuse freed addresses, so
     a later workspace can land on this pointer and would otherwise inherit a
-    stale live-count or graph-captured mark from the destroyed buffer.
+    stale live-count or graph-captured mark from the destroyed buffer.  CuTe
+    launch descriptors retain every tensor passed through DLPack, so they must
+    also be dropped before a symmetric output view is freed.
     """
     ptr = topk_idx_out.data_ptr()
     _LAST_STAGED_N.pop(ptr, None)
     _GRAPH_CAPTURED_BUFFERS.discard(ptr)
+    for stager in _STAGERS.values():
+        # launch_key[5] is topk_idx_out.data_ptr(); see fused_quant_stage().
+        if stager.launch_key is not None and stager.launch_key[5] == ptr:
+            stager.launch_key = None
+            stager.launch_args = None
+            stager.launch_kwargs = None
 
 
 def fused_quant_stage_supported(

@@ -51,6 +51,10 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             raise ValueError("intermediate_size and top_k must be positive")
         if not config.fast_math:
             raise NotImplementedError("fast_math=False is not supported")
+        if config.combine_dtype not in ("bf16", "nvfp4"):
+            raise ValueError(
+                f"combine_dtype must be 'bf16' or 'nvfp4', got {config.combine_dtype!r}"
+            )
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -113,6 +117,7 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 input_norm_const=config.input_norm_const,
                 data_parallel_size=config.data_parallel_size,
                 tensor_parallel_size=config.tensor_parallel_size,
+                combine_dtype=config.combine_dtype,
                 knobs=config.knobs,
             ),
             # MEGA_NO_DIST=1 single-rank sessions intentionally have no
@@ -201,10 +206,13 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             run_split_mega_moe,
         )
 
+        output_alignment = 32 if workspace.config.combine_dtype == "nvfp4" else 16
         direct_output = (
             output
             if output is not None
             and output.shape[0] >= workspace.config.max_tokens_per_rank
+            and output.is_contiguous()
+            and output.data_ptr() % output_alignment == 0
             else None
         )
         full_output = run_split_mega_moe(
@@ -237,8 +245,21 @@ class Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             config.input_norm_const,
             config.data_parallel_size,
             config.tensor_parallel_size,
+            config.combine_dtype,
             knobs_pool_key(config.knobs),
         )
+
+    def _forget_workspace_state(self, workspace) -> None:
+        # The fused stager caches CuTe/DLPack descriptors for its most recent
+        # launch.  Evict them before the symmetric workspace views are freed.
+        import sys
+
+        quant_stage = sys.modules.get(
+            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+        )
+        topk_ids = getattr(workspace, "topk_ids", None)
+        if quant_stage is not None and topk_ids is not None:
+            quant_stage.forget_staged_tokens(topk_ids)
 
 
 __all__ = ["Sm120Nvfp4Nvfp4CutedslMegaKernelBackend"]

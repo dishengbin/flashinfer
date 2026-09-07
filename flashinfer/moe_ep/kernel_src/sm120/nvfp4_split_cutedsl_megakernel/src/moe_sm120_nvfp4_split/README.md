@@ -10,9 +10,10 @@ The execution pipeline has three phases:
    FC1, applies `fc1_alpha`, SwiGLU and the selected top-k weight, then
    requantizes the result to block-16 NVFP4.
 2. `kernel_fc2_combine.py` consumes FC1 ready bundles, executes FC2, applies
-   `fc2_alpha`, converts to BF16, and writes each routed partial output back to
-   its source rank.
-3. `kernel_combine_reduce.py` reduces the top-k BF16 partial outputs.
+   `fc2_alpha`, rounds to BF16, and writes each routed partial output back to
+   its source rank as either BF16 or block-scaled NVFP4.
+3. `kernel_combine_reduce.py` decodes the selected wire format and reduces the
+   top-k partial outputs to BF16.
 
 K1 and K2 execute concurrently in disjoint Green Contexts. K1 publishes FC1
 output ready state bundle-by-bundle, so K2 can start before K1 finishes the
@@ -27,7 +28,10 @@ cross-NUMA traffic through staged NVSHMEM IBGDA transport.
 - Activation and weight scales: one `torch.float8_e4m3fn` value per 16 K
   elements.
 - FC1 handoff: packed E2M1 data plus per-16 E4M3 scales.
-- Accumulator: FP32; final partial and reduced output: BF16.
+- Accumulator: FP32; reduced output: BF16.
+- Combine wire format: BF16 by default, or packed E2M1 plus one BF16 amax per
+  16 hidden values (`16e2m1xbf16`). The NVFP4 plane occupies 0.625 bytes per
+  hidden value versus 2 bytes for BF16.
 - `hidden` must be divisible by 32 and `intermediate` by 64.
 
 The numerical order is:
@@ -35,8 +39,10 @@ The numerical order is:
 ```text
 K1: FP32 accumulator -> fc1_alpha -> SwiGLU -> top-k weight
     -> per-16 E4M3 scale + packed E2M1
-K2: FP32 accumulator -> fc2_alpha -> BF16 -> source-rank output
-K3: BF16 top-k reduction
+K2 BF16: FP32 accumulator -> fc2_alpha -> BF16 -> source-rank output
+K2 NVFP4: FP32 accumulator -> fc2_alpha -> BF16 -> per-16 BF16 amax
+           -> E2M1(value / (amax / 6)) -> source-rank data + scale planes
+K3: optional E2M1 dequantization by (amax / 6) -> FP32 top-k reduction -> BF16
 ```
 
 `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const` are explicit per-expert inputs.
@@ -112,8 +118,13 @@ Framework integrations should import `api.py`, not `mega_runner.py`:
 1. Construct `MegaMoEProblemSpec`.
 2. Call `select_compile_spec(...)` with topology and SM properties.
 3. Cache by `MegaMoECompileSpec.cache_key`.
-4. Build with `build_split_kernels(spec)` and allocate the returned local and
+4. Select `SplitKernelBuildOptions.combine_format` as `"bf16"` or
+   `"16e2m1xbf16"`.
+5. Build with `build_split_kernels(spec)` and allocate the returned local and
    symmetric workspace sizes.
+
+The NVFP4 combine implementation currently supports direct P2P token-back with
+`token_back_mode="epi_warps"`; IBGDA and dispatch-warp token-back remain BF16.
 
 The cache ABI includes the NVFP4 dtype/layout specialization. Do not reuse a
 W4A8 or W8A8 compiled-kernel cache entry.

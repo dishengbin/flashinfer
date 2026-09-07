@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass
@@ -22,4 +23,5 @@ class Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     input_norm_const: float = 1.0
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
+    combine_dtype: Literal["bf16", "nvfp4"] = "bf16"
     knobs: dict | None = None

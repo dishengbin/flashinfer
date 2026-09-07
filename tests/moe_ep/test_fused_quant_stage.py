@@ -21,6 +21,41 @@ import pytest
 pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
 
 
+def test_forget_staged_tokens_releases_launch_descriptors(monkeypatch):
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import quant_stage
+
+    ptr = 0x12345678
+
+    class FakeTensor:
+        @staticmethod
+        def data_ptr():
+            return ptr
+
+    compiled = object()
+    stager = quant_stage._CompiledStager(
+        dp=object(),
+        compiled=compiled,
+        launch_key=(1, 2, 3, 4, 5, ptr, 7, 8, 9, 10),
+        launch_args=(object(),),
+        launch_kwargs={"key": object()},
+    )
+    key = (987, 654, "nvfp4")
+    monkeypatch.setitem(quant_stage._STAGERS, key, stager)
+    monkeypatch.setitem(quant_stage._LAST_STAGED_N, ptr, 32)
+    quant_stage._GRAPH_CAPTURED_BUFFERS.add(ptr)
+    try:
+        quant_stage.forget_staged_tokens(FakeTensor())
+
+        assert stager.compiled is compiled
+        assert stager.launch_key is None
+        assert stager.launch_args is None
+        assert stager.launch_kwargs is None
+        assert ptr not in quant_stage._LAST_STAGED_N
+        assert ptr not in quant_stage._GRAPH_CAPTURED_BUFFERS
+    finally:
+        quant_stage._GRAPH_CAPTURED_BUFFERS.discard(ptr)
+
+
 def _require_blackwell():
     import torch
 

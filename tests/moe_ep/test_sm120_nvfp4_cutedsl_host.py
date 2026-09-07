@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 import torch
 
 from flashinfer.moe_ep import BootstrapConfig, FleetParams
@@ -13,6 +15,7 @@ from flashinfer.moe_ep.backends.mega.kernel.sm120.nvfp4_nvfp4_bf16_cutedsl impor
     Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+    bootstrap_paths,
     select_graph_compile_bucket,
 )
 from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.weights import (
@@ -28,6 +31,18 @@ def test_config_uses_post_swiglu_intermediate() -> None:
     )
     assert config.intermediate_size == 2048
     assert config.kernel_name == "sm120_nvfp4_nvfp4_bf16_cutedsl"
+    assert config.combine_dtype == "bf16"
+
+
+def test_config_rejects_unknown_combine_dtype() -> None:
+    with pytest.raises(ValueError, match="combine_dtype"):
+        Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(
+            Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=2048,
+                top_k=6,
+                combine_dtype="fp8",  # type: ignore[arg-type]
+            )
+        )
 
 
 def test_gate_up_interleave_is_grouped_in_sixteen_rows() -> None:
@@ -65,6 +80,22 @@ def test_decode_graph_compile_bucket_selection() -> None:
         assert select_graph_compile_bucket(requested, capacity) == bucket
 
 
+def test_combine_reduce_flattens_large_token_grid() -> None:
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split.kernel_combine_reduce import (
+        _topk_reduce_launch_geometry,
+    )
+
+    hidden_blocks, grid = _topk_reduce_launch_geometry(
+        tokens=81450,
+        hidden=6144,
+        threads=512,
+    )
+
+    assert hidden_blocks == 2
+    assert grid == [162900, 1, 1]
+
+
 def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
     fleet = FleetParams(
@@ -73,12 +104,13 @@ def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:
         token_hidden_size=4096,
     )
 
-    def key(*, norm_const: float = 1.0):
+    def key(*, norm_const: float = 1.0, combine_dtype: str = "bf16"):
         backend = Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(
             Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=4096,
                 top_k=6,
                 input_norm_const=norm_const,
+                combine_dtype=combine_dtype,
             )
         )
         backend.bind_ep_bootstrap(
@@ -88,6 +120,29 @@ def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:
 
     assert key() == key()
     assert key(norm_const=2.0) != key()
+    assert key(combine_dtype="nvfp4") != key()
+
+
+def test_workspace_teardown_forgets_fused_stage_descriptors(monkeypatch) -> None:
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import quant_stage
+
+    backend = Sm120Nvfp4Nvfp4CutedslMegaKernelBackend(
+        Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=2304,
+            top_k=8,
+        )
+    )
+    topk_ids = object()
+    forgotten: list[object] = []
+    monkeypatch.setattr(
+        quant_stage,
+        "forget_staged_tokens",
+        forgotten.append,
+    )
+
+    backend._forget_workspace_state(SimpleNamespace(topk_ids=topk_ids))
+
+    assert forgotten == [topk_ids]
 
 
 def test_production_modules_do_not_import_mega_runner() -> None:

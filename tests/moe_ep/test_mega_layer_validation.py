@@ -506,6 +506,34 @@ def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
     assert torch.equal(workspace.topk_weights[:num_tokens], topk_weights)
 
 
+def test_deep_gemm_workspace_teardown_forgets_fused_stage_descriptors(monkeypatch):
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend import (
+        DeepGemmMegaKernelBackend,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.config import (
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import quant_stage
+
+    backend = DeepGemmMegaKernelBackend(
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+            intermediate_size=128,
+            top_k=2,
+        )
+    )
+    topk_idx = object()
+    forgotten: list[object] = []
+    monkeypatch.setattr(
+        quant_stage,
+        "forget_staged_tokens",
+        forgotten.append,
+    )
+
+    backend._forget_workspace_state(SimpleNamespace(topk_idx=topk_idx))
+
+    assert forgotten == [topk_idx]
+
+
 def test_mega_layer_init_accepts_valid_transformed_weights():
     layer = _mega_layer()
     assert layer._transformed is not None

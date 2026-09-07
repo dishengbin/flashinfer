@@ -172,3 +172,16 @@ class DeepGemmMegaKernelBackend(MegaKernelBackend):
             fp.token_hidden_size,
             k.intermediate_size,
         )
+
+    def _forget_workspace_state(self, workspace) -> None:
+        # The shared fused stager retains CuTe/DLPack launch descriptors for
+        # its latest symmetric-workspace views.  Evict them before DeepGEMM
+        # releases that workspace.
+        import sys
+
+        quant_stage = sys.modules.get(
+            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+        )
+        topk_idx = getattr(workspace, "topk_idx", None)
+        if quant_stage is not None and topk_idx is not None:
+            quant_stage.forget_staged_tokens(topk_idx)

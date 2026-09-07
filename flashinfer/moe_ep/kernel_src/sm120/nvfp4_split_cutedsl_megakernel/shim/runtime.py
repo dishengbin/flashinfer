@@ -65,11 +65,19 @@ class MegaMoESm120Nvfp4Config:
     input_norm_const: float = 1.0
     data_parallel_size: int = 1
     tensor_parallel_size: int = 1
+    combine_dtype: str = "bf16"
     knobs: dict[str, Any] | None = None
 
     @property
     def local_experts(self) -> int:
         return self.num_total_experts // self.world_size
+
+    @property
+    def combine_format(self) -> str:
+        return {
+            "bf16": "bf16",
+            "nvfp4": "16e2m1xbf16",
+        }[self.combine_dtype]
 
     def validate(self) -> None:
         if self.world_size <= 0 or not 0 <= self.rank < self.world_size:
@@ -86,6 +94,10 @@ class MegaMoESm120Nvfp4Config:
             raise ValueError("max_tokens_per_rank must be positive")
         if self.input_norm_const <= 0:
             raise ValueError("input_norm_const must be positive")
+        if self.combine_dtype not in ("bf16", "nvfp4"):
+            raise ValueError(
+                f"combine_dtype must be 'bf16' or 'nvfp4', got {self.combine_dtype!r}"
+            )
 
 
 @dataclass
@@ -106,6 +118,7 @@ class _ExecutionStorage:
     local_workspace: torch.Tensor
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
+    combine_sf: torch.Tensor | None
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     green_trace: torch.Tensor | None = None
 
@@ -117,6 +130,7 @@ class _ExecutionBuffers:
     local_workspace: torch.Tensor
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
+    combine_sf: torch.Tensor | None
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     green_trace: torch.Tensor | None = None
 
@@ -312,6 +326,7 @@ class MegaMoESm120Nvfp4Frontend:
                 concurrent_k1_k2=True,
                 k1_active_clusters=actual_k1,
                 k2_active_clusters=actual_k2,
+                combine_format=cfg.combine_format,
             ),
         )
 
@@ -321,6 +336,7 @@ class MegaMoESm120Nvfp4Frontend:
         local_workspace: torch.Tensor,
         shared_workspace: torch.Tensor,
         combine_output: torch.Tensor,
+        combine_sf: torch.Tensor | None,
         epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         green_trace: torch.Tensor | None,
         stream,
@@ -342,6 +358,7 @@ class MegaMoESm120Nvfp4Frontend:
             fc2_alpha=self._to_cute(fc2_alpha, assumed_align=4),
             fc1_norm_const=self._to_cute(fc1_norm_const, assumed_align=4),
             combine_output=self._to_cute(combine_output),
+            combine_sf=(self._to_cute(combine_sf) if combine_sf is not None else None),
             combine_ready_flags=None,
             fc2_block_done_counter=None,
             local_workspace=self._to_cute(local_workspace, static_layout=True),
@@ -400,14 +417,36 @@ class MegaMoESm120Nvfp4Frontend:
             )
             shared_workspace = sym_zeros((bundle.shared_workspace_bytes,), torch.uint8)
             self.workspace._sym_roots.append(shared_workspace)
-            combine_output, root = sym_byte_view(
-                (
-                    self.compile_bucket,
-                    self.config.num_topk,
-                    self.config.hidden,
-                ),
-                torch.bfloat16,
-            )
+            if self.config.combine_dtype == "bf16":
+                combine_output, root = sym_byte_view(
+                    (
+                        self.compile_bucket,
+                        self.config.num_topk,
+                        self.config.hidden,
+                    ),
+                    torch.bfloat16,
+                )
+                combine_sf = None
+            else:
+                # torch stores two logical E2M1 values per physical byte;
+                # cutlass.torch.from_dlpack exposes the logical hidden extent.
+                combine_output, root = sym_byte_view(
+                    (
+                        self.compile_bucket,
+                        self.config.num_topk,
+                        self.config.hidden // 2,
+                    ),
+                    ACTIVATION_DTYPE,
+                )
+                combine_sf, sf_root = sym_byte_view(
+                    (
+                        self.compile_bucket,
+                        self.config.num_topk,
+                        self.config.hidden // 16,
+                    ),
+                    torch.bfloat16,
+                )
+                self.workspace._sym_roots.append(sf_root)
             self.workspace._sym_roots.append(root)
             epilogue_args = (
                 self.workspace.fc1_alpha,
@@ -434,6 +473,7 @@ class MegaMoESm120Nvfp4Frontend:
                 local_workspace=local_workspace,
                 shared_workspace=shared_workspace,
                 combine_output=combine_output,
+                combine_sf=combine_sf,
                 epilogue_args=epilogue_args,
                 green_trace=green_trace,
             )
@@ -444,6 +484,7 @@ class MegaMoESm120Nvfp4Frontend:
             local_workspace=storage.local_workspace,
             shared_workspace=storage.shared_workspace,
             combine_output=storage.combine_output,
+            combine_sf=storage.combine_sf,
             epilogue_args=storage.epilogue_args,
             green_trace=storage.green_trace,
         )
@@ -469,6 +510,7 @@ class MegaMoESm120Nvfp4Frontend:
         local_workspace = execution.local_workspace
         shared_workspace = execution.shared_workspace
         combine_output = execution.combine_output
+        combine_sf = execution.combine_sf
         epilogue_args = execution.epilogue_args
         green_trace = execution.green_trace
 
@@ -483,6 +525,7 @@ class MegaMoESm120Nvfp4Frontend:
             local_workspace,
             shared_workspace,
             combine_output,
+            combine_sf,
             epilogue_args,
             green_trace,
             root_cuda,
@@ -535,16 +578,29 @@ class MegaMoESm120Nvfp4Frontend:
             )
 
         combine_bucket = combine_output[: self.compile_bucket]
+        combine_sf_bucket = (
+            combine_sf[: self.compile_bucket] if combine_sf is not None else None
+        )
         output_bucket = inputs.output[: self.compile_bucket]
         k3_plan = compile_combine_reduce(
             combine_bucket,
             output_bucket,
             None,
+            combine_sf=combine_sf_bucket,
+            combine_format=self.config.combine_format,
             stream=root_cuda,
         )
-        compiled_k3, combine_cute, output_cute, score_cute, k3_stream = k3_plan
+        (
+            compiled_k3,
+            combine_cute,
+            combine_sf_cute,
+            output_cute,
+            score_cute,
+            k3_stream,
+        ) = k3_plan
         runtime_k3 = dict(
             combine_cute=combine_cute,
+            combine_sf_cute=combine_sf_cute,
             reduced_cute=output_cute,
             topk_score_cute=score_cute,
             stream=k3_stream,

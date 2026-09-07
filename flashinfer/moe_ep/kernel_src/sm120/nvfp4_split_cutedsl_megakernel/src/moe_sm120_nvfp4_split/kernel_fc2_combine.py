@@ -24,6 +24,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 
+from common.megamoe_constants import Fp32Max, Nvfp4E2M1RcpLimit
+
 from .custom_ext import Sm120SwapABNvfp4Fc12SchedExtension
 from .fc1_fc2_fuse_sched import BlockPhase, MoEFusedFc12SchedulerParams
 from .megamoe_kernel import Sm120MegaMoENvfp4SwapABKernel
@@ -35,6 +37,7 @@ from .sm120_mma import (
     get_layout_sfb_tv,
     issue_m64n8k64_nvfp4,
     make_sm120_ldmatrix_atom,
+    pack_e2m1x2,
     partition_fragment_sfa_for_sm120_mma,
     partition_fragment_sfb_for_sm120_mma,
 )
@@ -103,6 +106,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
 
     @cute.jit
     def _owner_direct_row(self, token_comm_args, metadata):
+        row_bytes = (self.hidden * self.combine_format.act_dtype.width + 7) // 8
         output_addr = (
             token_comm_args.combine_output.iterator.toint()
             + (
@@ -110,10 +114,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                 * cutlass.Int64(self.num_topk)
                 + cutlass.Int64(metadata.src_topk)
             )
-            * cutlass.Int64(self.hidden * 2)
+            * cutlass.Int64(row_bytes)
         )
         local_ptr = cute.make_ptr(
-            self.fc2_output_dtype,
+            self.combine_format.act_dtype,
             output_addr,
             AddressSpace.gmem,
             assumed_align=16,
@@ -128,6 +132,7 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
         self, token_comm_args, metadata, canonical_slot
     ):
         """Return the source-GPU row chosen for one owner group."""
+        row_bytes = (self.hidden * self.combine_format.act_dtype.width + 7) // 8
         output_addr = (
             token_comm_args.combine_output.iterator.toint()
             + (
@@ -135,10 +140,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                 * cutlass.Int64(self.num_topk)
                 + cutlass.Int64(canonical_slot)
             )
-            * cutlass.Int64(self.hidden * 2)
+            * cutlass.Int64(row_bytes)
         )
         local_ptr = cute.make_ptr(
-            self.fc2_output_dtype,
+            self.combine_format.act_dtype,
             output_addr,
             AddressSpace.gmem,
             assumed_align=16,
@@ -147,6 +152,85 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
             local_ptr, metadata.src_rank
         )
         return cute.make_tensor(peer_ptr, cute.make_layout(self.hidden))
+
+    @cute.jit
+    def _store_quantized_combine_row(
+        self,
+        token_comm_args,
+        pool_token,
+        fc2_store_token,
+        hidden0,
+        hidden1,
+        packed_word0,
+        packed_word1,
+        combine_sf,
+    ):
+        """Store one token's 16 E2M1 values and BF16 amax to its owner."""
+
+        if cutlass.const_expr(
+            token_comm_args is not None and not self.token_back_by_dispatch
+        ):
+            metadata = TokenSrcMetadata.load(
+                token_comm_args.token_src_metadata.iterator.toint()
+                + cutlass.Int64(pool_token)
+                * cutlass.Int64(TokenSrcMetadata.nbytes)
+            )
+            data_addr = (
+                token_comm_args.combine_output.iterator.toint()
+                + (
+                    cutlass.Int64(metadata.src_token)
+                    * cutlass.Int64(self.num_topk)
+                    + cutlass.Int64(metadata.src_topk)
+                )
+                * cutlass.Int64(self.hidden // 2)
+            )
+            local_data_ptr = cute.make_ptr(
+                cutlass.Int32,
+                data_addr,
+                AddressSpace.gmem,
+                assumed_align=16,
+            )
+            data_ptr = (
+                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                    local_data_ptr, metadata.src_rank
+                )
+            )
+            data_words = cute.make_tensor(
+                data_ptr, cute.make_layout(self.hidden // 8)
+            )
+            local_sf_row = cute.slice_(
+                token_comm_args.combine_sf,
+                (metadata.src_token, metadata.src_topk, None),
+            )
+            sf_row = cute.make_tensor(
+                token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                    local_sf_row.iterator, metadata.src_rank
+                ),
+                local_sf_row.layout,
+            )
+        else:
+            data_addr = (
+                token_comm_args.combine_output.iterator.toint()
+                + cutlass.Int64(fc2_store_token)
+                * cutlass.Int64(self.hidden // 2)
+            )
+            data_words = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Int32,
+                    data_addr,
+                    AddressSpace.gmem,
+                    assumed_align=16,
+                ),
+                cute.make_layout(self.hidden // 8),
+            )
+            sf_row = cute.slice_(
+                token_comm_args.combine_sf,
+                (fc2_store_token, 0, None),
+            )
+
+        data_words[hidden0 // cutlass.Int32(8)] = packed_word0
+        data_words[hidden1 // cutlass.Int32(8)] = packed_word1
+        sf_row[hidden0 // cutlass.Int32(16)] = combine_sf
 
     @cute.kernel
     def fc2_combine_kernel_impl(self, tiled_mma: cute.TiledMma, tiled_mma_sfb: cute.TiledMma, tma_atom_fc1_weight: cute.CopyAtom, tma_tensor_fc1_weight: cute.Tensor, tma_atom_activation: cute.CopyAtom, tma_tensor_activation: cute.Tensor, tma_atom_fc1_weight_sf: cute.CopyAtom, tma_tensor_fc1_weight_sf: cute.Tensor, tma_atom_activation_sf: cute.CopyAtom, tma_tensor_activation_sf: cute.Tensor, tma_atom_fc2_weight: cute.CopyAtom, tma_tensor_fc2_weight: cute.Tensor, tma_atom_fc1_output_as_fc2_input: cute.CopyAtom, tma_tensor_fc1_output_as_fc2_input: cute.Tensor, tma_atom_fc2_weight_sf: cute.CopyAtom, tma_tensor_fc2_weight_sf: cute.Tensor, tma_atom_fc1_output_sf_as_fc2_input: cute.CopyAtom, tma_tensor_fc1_output_sf_as_fc2_input: cute.Tensor, fc1_weight_gemm: cute.Tensor, activation_gemm: cute.Tensor, fc1_output_gemm: cute.Tensor, fc1_weight_sf_gemm: cute.Tensor, activation_sf_gemm: cute.Tensor, fc1_output_sf_gemm: cute.Tensor, fc2_weight_gemm: cute.Tensor, fc2_output: cute.Tensor, fc2_weight_sf_gemm: cute.Tensor, fc1_output_sf_gemm_for_fc2_load: cute.Tensor, topk_scores: cute.Tensor, fc1_done_counter: cute.Tensor, combine_ready_flags: Optional[cute.Tensor], fc2_block_done_counter: Optional[cute.Tensor], fc1_alpha: Optional[cute.Tensor], fc2_alpha: Optional[cute.Tensor], fc1_norm_const: Optional[cute.Tensor], sched_params: MoEFusedFc12SchedulerParams, cluster_layout_vmnk: cute.Layout, cluster_layout_sfb_vmnk: cute.Layout, a_smem_layout_staged: cute.ComposedLayout, b_smem_layout_staged: cute.ComposedLayout, sfa_smem_layout_staged: cute.Layout, sfb_smem_layout_staged: cute.Layout, fc1_output_smem_layout_staged: cute.ComposedLayout, token_comm_args=None, green_trace: Optional[cute.Tensor]=None, k2_ready_queue_desc: Optional[cute.Tensor]=None, k2_ready_queue_ready: Optional[cute.Tensor]=None, k2_ready_queue_state: Optional[cute.Tensor]=None):
@@ -907,6 +991,210 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                     scaled_acc1 = acc[1] * fc2_alpha_value
                     scaled_acc2 = acc[2] * fc2_alpha_value
                     scaled_acc3 = acc[3] * fc2_alpha_value
+                    packed_token0_hidden0 = cutlass.Uint8(0)
+                    packed_token0_hidden1 = cutlass.Uint8(0)
+                    packed_token1_hidden0 = cutlass.Uint8(0)
+                    packed_token1_hidden1 = cutlass.Uint8(0)
+                    packed_token0_word0 = cutlass.Int32(0)
+                    packed_token0_word1 = cutlass.Int32(0)
+                    packed_token1_word0 = cutlass.Int32(0)
+                    packed_token1_word1 = cutlass.Int32(0)
+                    combine_sf0 = cutlass.BFloat16(0.0)
+                    combine_sf1 = cutlass.BFloat16(0.0)
+                    if cutlass.const_expr(self.combine_format.is_quantized):
+                        # Match the BF16 baseline's epilogue rounding before
+                        # finding each block's amax and encoding E2M1.
+                        value0 = cutlass.Float32(
+                            scaled_acc0.to(cutlass.BFloat16)
+                        )
+                        value1 = cutlass.Float32(
+                            scaled_acc1.to(cutlass.BFloat16)
+                        )
+                        value2 = cutlass.Float32(
+                            scaled_acc2.to(cutlass.BFloat16)
+                        )
+                        value3 = cutlass.Float32(
+                            scaled_acc3.to(cutlass.BFloat16)
+                        )
+                        amax0 = cute.arch.fmax(
+                            cute.math.absf(value0), cute.math.absf(value2)
+                        )
+                        amax1 = cute.arch.fmax(
+                            cute.math.absf(value1), cute.math.absf(value3)
+                        )
+                        for xor_mask in (4, 8, 16):
+                            peer_lane = lane_idx ^ cutlass.Int32(xor_mask)
+                            amax0 = cute.arch.fmax(
+                                amax0,
+                                cute.arch.shuffle_sync(amax0, peer_lane),
+                            )
+                            amax1 = cute.arch.fmax(
+                                amax1,
+                                cute.arch.shuffle_sync(amax1, peer_lane),
+                            )
+                        combine_sf0 = amax0.to(cutlass.BFloat16)
+                        combine_sf1 = amax1.to(cutlass.BFloat16)
+                        decode_scale0 = cutlass.Float32(
+                            combine_sf0
+                        ) * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                        decode_scale1 = cutlass.Float32(
+                            combine_sf1
+                        ) * cutlass.Float32(Nvfp4E2M1RcpLimit)
+                        inv0 = cute.arch.fmin(
+                            cute.arch.rcp_approx(decode_scale0),
+                            cutlass.Float32(Fp32Max),
+                        )
+                        inv1 = cute.arch.fmin(
+                            cute.arch.rcp_approx(decode_scale1),
+                            cutlass.Float32(Fp32Max),
+                        )
+                        inv0 = inv0 * cute.arch.fmin(
+                            decode_scale0 * cutlass.Float32(1e30),
+                            cutlass.Float32(1.0),
+                        )
+                        inv1 = inv1 * cute.arch.fmin(
+                            decode_scale1 * cutlass.Float32(1e30),
+                            cutlass.Float32(1.0),
+                        )
+                        q0 = value0 * inv0
+                        q1 = value1 * inv1
+                        q2 = value2 * inv0
+                        q3 = value3 * inv1
+                        partner_lane = lane_idx ^ cutlass.Int32(4)
+                        peer_q0 = cute.arch.shuffle_sync(q0, partner_lane)
+                        peer_q1 = cute.arch.shuffle_sync(q1, partner_lane)
+                        peer_q2 = cute.arch.shuffle_sync(q2, partner_lane)
+                        peer_q3 = cute.arch.shuffle_sync(q3, partner_lane)
+                        if (lane_g & cutlass.Int32(1)) == cutlass.Int32(0):
+                            packed_token0_hidden0 = pack_e2m1x2(q0, peer_q0)
+                            packed_token0_hidden1 = pack_e2m1x2(q2, peer_q2)
+                            packed_token1_hidden0 = pack_e2m1x2(q1, peer_q1)
+                            packed_token1_hidden1 = pack_e2m1x2(q3, peer_q3)
+
+                        # Four adjacent packed bytes form one naturally aligned
+                        # 32-bit transaction.  This cuts the FP4 data-plane
+                        # stores from eight byte stores to two word stores per
+                        # token and lets only lane_g=0 resolve peer metadata.
+                        packed_token0_word0 = (
+                            cutlass.Int32(packed_token0_hidden0)
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token0_hidden0,
+                                        lane_idx ^ cutlass.Int32(8),
+                                    )
+                                )
+                                << cutlass.Int32(8)
+                            )
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token0_hidden0,
+                                        lane_idx ^ cutlass.Int32(16),
+                                    )
+                                )
+                                << cutlass.Int32(16)
+                            )
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token0_hidden0,
+                                        lane_idx ^ cutlass.Int32(24),
+                                    )
+                                )
+                                << cutlass.Int32(24)
+                            )
+                        )
+                        packed_token0_word1 = (
+                            cutlass.Int32(packed_token0_hidden1)
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token0_hidden1,
+                                        lane_idx ^ cutlass.Int32(8),
+                                    )
+                                )
+                                << cutlass.Int32(8)
+                            )
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token0_hidden1,
+                                        lane_idx ^ cutlass.Int32(16),
+                                    )
+                                )
+                                << cutlass.Int32(16)
+                            )
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token0_hidden1,
+                                        lane_idx ^ cutlass.Int32(24),
+                                    )
+                                )
+                                << cutlass.Int32(24)
+                            )
+                        )
+                        packed_token1_word0 = (
+                            cutlass.Int32(packed_token1_hidden0)
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token1_hidden0,
+                                        lane_idx ^ cutlass.Int32(8),
+                                    )
+                                )
+                                << cutlass.Int32(8)
+                            )
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token1_hidden0,
+                                        lane_idx ^ cutlass.Int32(16),
+                                    )
+                                )
+                                << cutlass.Int32(16)
+                            )
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token1_hidden0,
+                                        lane_idx ^ cutlass.Int32(24),
+                                    )
+                                )
+                                << cutlass.Int32(24)
+                            )
+                        )
+                        packed_token1_word1 = (
+                            cutlass.Int32(packed_token1_hidden1)
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token1_hidden1,
+                                        lane_idx ^ cutlass.Int32(8),
+                                    )
+                                )
+                                << cutlass.Int32(8)
+                            )
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token1_hidden1,
+                                        lane_idx ^ cutlass.Int32(16),
+                                    )
+                                )
+                                << cutlass.Int32(16)
+                            )
+                            | (
+                                cutlass.Int32(
+                                    cute.arch.shuffle_sync(
+                                        packed_token1_hidden1,
+                                        lane_idx ^ cutlass.Int32(24),
+                                    )
+                                )
+                                << cutlass.Int32(24)
+                            )
+                        )
                     token0 = cutlass.Int32(ng * MMA_N) + lane_t * cutlass.Int32(2)
                     token1 = token0 + cutlass.Int32(1)
                     valid_token0 = token0
@@ -927,7 +1215,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                             if lane_idx == cutlass.Int32(0):
                                 tile_pack_start = read_globaltimer()
                     iket.range_push('sm120_fc2_store_bf16_pack')
-                    if cutlass.const_expr(self.fc2_packed_store):
+                    if cutlass.const_expr(
+                        self.fc2_packed_store
+                        and not self.combine_format.is_quantized
+                    ):
                         partner_lane = lane_idx ^ cutlass.Int32(4)
                         rFc2Store[0] = scaled_acc0.to(self.fc2_output_dtype)
                         rFc2Store[1] = cute.arch.shuffle_sync(scaled_acc0, partner_lane).to(self.fc2_output_dtype)
@@ -953,7 +1244,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                         if compute_warp == cutlass.Int32(0):
                             if lane_idx == cutlass.Int32(0):
                                 tile_peer_store_start = read_globaltimer()
-                    if valid_token0 < work_tile_info.valid_tokens_in_tile:
+                    if (
+                        valid_token0 < work_tile_info.valid_tokens_in_tile
+                        and hidden0 < cutlass.Int32(self.hidden)
+                    ):
                         fc2_store_token0 = pool_token0
                         if cutlass.const_expr(self.ibgda_k2_direct_staging):
                             fc2_store_token0 = cutlass.Int32(
@@ -964,7 +1258,21 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                                     + pool_token0
                                 ]
                             )
-                        if cutlass.const_expr(self.fc2_packed_store):
+                        if cutlass.const_expr(self.combine_format.is_quantized):
+                            if lane_g == cutlass.Int32(0):
+                                iket.range_push('sm120_fc2_store_metadata_address')
+                                self._store_quantized_combine_row(
+                                    token_comm_args,
+                                    pool_token0,
+                                    fc2_store_token0,
+                                    hidden0,
+                                    hidden1,
+                                    packed_token0_word0,
+                                    packed_token0_word1,
+                                    combine_sf0,
+                                )
+                                iket.range_pop()
+                        elif cutlass.const_expr(self.fc2_packed_store):
                             if lane_g & cutlass.Int32(1) == cutlass.Int32(0):
                                 iket.range_push('sm120_fc2_store_metadata_address')
                                 if cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):
@@ -1002,7 +1310,10 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                             fc2_output[fc2_store_token0, 0, hidden0] = scaled_acc0.to(self.fc2_output_dtype)
                             fc2_output[fc2_store_token0, 0, hidden1] = scaled_acc2.to(self.fc2_output_dtype)
                             iket.range_pop()
-                    if valid_token1 < work_tile_info.valid_tokens_in_tile:
+                    if (
+                        valid_token1 < work_tile_info.valid_tokens_in_tile
+                        and hidden0 < cutlass.Int32(self.hidden)
+                    ):
                         fc2_store_token1 = pool_token1
                         if cutlass.const_expr(self.ibgda_k2_direct_staging):
                             fc2_store_token1 = cutlass.Int32(
@@ -1013,7 +1324,21 @@ class Sm120Fc2CombineKernel(Sm120MegaMoENvfp4SwapABKernel):
                                     + pool_token1
                                 ]
                             )
-                        if cutlass.const_expr(self.fc2_packed_store):
+                        if cutlass.const_expr(self.combine_format.is_quantized):
+                            if lane_g == cutlass.Int32(0):
+                                iket.range_push('sm120_fc2_store_metadata_address')
+                                self._store_quantized_combine_row(
+                                    token_comm_args,
+                                    pool_token1,
+                                    fc2_store_token1,
+                                    hidden0,
+                                    hidden1,
+                                    packed_token1_word0,
+                                    packed_token1_word1,
+                                    combine_sf1,
+                                )
+                                iket.range_pop()
+                        elif cutlass.const_expr(self.fc2_packed_store):
                             if lane_g & cutlass.Int32(1) == cutlass.Int32(0):
                                 iket.range_push('sm120_fc2_store_metadata_address')
                                 if cutlass.const_expr(token_comm_args is not None and (not self.token_back_by_dispatch)):

@@ -79,7 +79,13 @@ def _problem(
     }
 
 
-def _make_layer(rank: int, world_size: int, problem: dict):
+def _make_layer(
+    rank: int,
+    world_size: int,
+    problem: dict,
+    *,
+    combine_dtype: str = "bf16",
+):
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -100,6 +106,7 @@ def _make_layer(rank: int, world_size: int, problem: dict):
             megakernel=Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
                 intermediate_size=problem["intermediate"],
                 top_k=problem["top_k"],
+                combine_dtype=combine_dtype,
             ),
             quantize_input=True,
             preprocess_weights=True,
@@ -115,25 +122,172 @@ def test_sm120_nvfp4_single_rank_replay_and_outer_cuda_graph() -> None:
         pytest.skip("single-rank test")
 
     problem = _problem(0, 1, tokens=16, capacity=16)
-    layer = _make_layer(0, 1, problem)
-    try:
-        layer.warmup(problem["inputs"])
-        eager0 = layer(problem["inputs"]).clone()
-        eager1 = layer(problem["inputs"]).clone()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            captured = layer(problem["inputs"])
-        graph.replay()
-        replay0 = captured.clone()
-        graph.replay()
-        replay1 = captured.clone()
-        torch.cuda.synchronize()
-        assert torch.isfinite(eager0).all()
-        torch.testing.assert_close(eager0, eager1, atol=0.0, rtol=0.0)
-        torch.testing.assert_close(eager0, replay0, atol=0.0, rtol=0.0)
-        torch.testing.assert_close(replay0, replay1, atol=0.0, rtol=0.0)
-    finally:
-        layer.destroy()
+    outputs = {}
+    for combine_dtype in ("bf16", "nvfp4"):
+        layer = _make_layer(0, 1, problem, combine_dtype=combine_dtype)
+        try:
+            layer.warmup(problem["inputs"])
+            eager0 = layer(problem["inputs"]).clone()
+            eager1 = layer(problem["inputs"]).clone()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = layer(problem["inputs"])
+            graph.replay()
+            replay0 = captured.clone()
+            graph.replay()
+            replay1 = captured.clone()
+            torch.cuda.synchronize()
+            assert torch.isfinite(eager0).all()
+            torch.testing.assert_close(eager0, eager1, atol=0.0, rtol=0.0)
+            torch.testing.assert_close(eager0, replay0, atol=0.0, rtol=0.0)
+            torch.testing.assert_close(replay0, replay1, atol=0.0, rtol=0.0)
+            outputs[combine_dtype] = eager0
+        finally:
+            layer.destroy()
+
+    bf16 = outputs["bf16"].float()
+    nvfp4 = outputs["nvfp4"].float()
+    rel_l2 = torch.linalg.vector_norm(nvfp4 - bf16) / torch.linalg.vector_norm(bf16)
+    assert rel_l2.item() < 0.15
+
+
+@pytest.mark.arch_sm120
+def test_sm120_nvfp4_combine_reduce_above_grid_y_limit() -> None:
+    """K3 must cover token 65536+ without using CUDA gridDim.y."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank test")
+
+    from cuda.bindings import driver as cuda
+
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+        bootstrap_paths,
+    )
+
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split.api import compile_combine_reduce
+
+    tokens = 81450
+    top_k = 8
+    threads = 32
+    # Two hidden blocks with a short tail, matching the customer's two-block
+    # H=6144 launch while keeping the regression test's allocation modest.
+    hidden = 8 * (threads + 1)
+    combine_output = torch.zeros(
+        (tokens, top_k, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    reduced_output = torch.full(
+        (tokens, hidden), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    probe_tokens = torch.tensor(
+        (0, 65535, 65536, tokens - 1), dtype=torch.int64, device="cuda"
+    )
+    probe_values = torch.arange(1, 5, dtype=torch.bfloat16, device="cuda")
+    combine_output[probe_tokens] = probe_values[:, None, None]
+
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    (
+        compiled,
+        combine_cute,
+        combine_sf_cute,
+        reduced_cute,
+        score_cute,
+        stream,
+    ) = compile_combine_reduce(
+        combine_output,
+        reduced_output,
+        None,
+        threads=threads,
+        stream=stream,
+    )
+    executor = compiled.to(None)
+    executor(
+        combine_cute=combine_cute,
+        combine_sf_cute=combine_sf_cute,
+        reduced_cute=reduced_cute,
+        topk_score_cute=score_cute,
+        stream=stream,
+    )
+    torch.cuda.synchronize()
+
+    actual = reduced_output[probe_tokens]
+    expected = (probe_values * top_k)[:, None].expand_as(actual)
+    torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.arch_sm120
+def test_sm120_nvfp4_combine_reduce_matches_decode_reference() -> None:
+    """NVFP4 K3 must decode E2M1 with its per-16 BF16 amax scale."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank test")
+
+    from cuda.bindings import driver as cuda
+
+    from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
+        bootstrap_paths,
+    )
+
+    bootstrap_paths()
+    from moe_sm120_nvfp4_split.api import compile_combine_reduce
+
+    tokens, top_k, hidden = 3, 2, 32
+    packed = torch.arange(
+        tokens * top_k * (hidden // 2), dtype=torch.uint8, device="cuda"
+    ).reshape(tokens, top_k, hidden // 2)
+    combine_output = packed.view(torch.float4_e2m1fn_x2)
+    combine_sf = (
+        torch.arange(
+            1,
+            tokens * top_k * (hidden // 16) + 1,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        .reshape(tokens, top_k, hidden // 16)
+        .to(torch.bfloat16)
+    )
+    reduced_output = torch.empty((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    (
+        compiled,
+        combine_cute,
+        combine_sf_cute,
+        reduced_cute,
+        score_cute,
+        stream,
+    ) = compile_combine_reduce(
+        combine_output,
+        reduced_output,
+        None,
+        combine_sf=combine_sf,
+        combine_format="16e2m1xbf16",
+        stream=stream,
+    )
+    compiled.to(None)(
+        combine_cute=combine_cute,
+        combine_sf_cute=combine_sf_cute,
+        reduced_cute=reduced_cute,
+        topk_score_cute=score_cute,
+        stream=stream,
+    )
+    torch.cuda.synchronize()
+
+    decode_table = torch.tensor(
+        (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    low = decode_table[(packed & 0xF).long()]
+    high = decode_table[(packed >> 4).long()]
+    decoded = torch.stack((low, high), dim=-1).flatten(-2)
+    expected = (
+        (decoded * combine_sf.float().repeat_interleave(16, dim=-1) * (1.0 / 6.0))
+        .sum(dim=1)
+        .to(torch.bfloat16)
+    )
+    torch.testing.assert_close(reduced_output, expected, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.gpu_4
@@ -153,18 +307,31 @@ def test_sm120_nvfp4_four_rank_imbalanced_second_epoch() -> None:
         tokens=tokens_by_rank[rank],
         capacity=32,
     )
-    layer = _make_layer(rank, world_size, problem)
-    try:
-        outputs = []
-        for _ in range(3):
-            layer.stage_inputs(
-                problem["inputs"], compile_tokens_per_rank=max(tokens_by_rank)
-            )
-            outputs.append(layer.compute_staged(output=None).clone())
-        torch.cuda.synchronize()
-        dist.barrier()
-        assert torch.isfinite(outputs[0]).all()
-        for output in outputs[1:]:
-            torch.testing.assert_close(outputs[0], output, atol=0.0, rtol=0.0)
-    finally:
-        layer.destroy()
+    combine_outputs = {}
+    for combine_dtype in ("bf16", "nvfp4"):
+        layer = _make_layer(
+            rank,
+            world_size,
+            problem,
+            combine_dtype=combine_dtype,
+        )
+        try:
+            outputs = []
+            for _ in range(3):
+                layer.stage_inputs(
+                    problem["inputs"], compile_tokens_per_rank=max(tokens_by_rank)
+                )
+                outputs.append(layer.compute_staged(output=None).clone())
+            torch.cuda.synchronize()
+            dist.barrier()
+            assert torch.isfinite(outputs[0]).all()
+            for output in outputs[1:]:
+                torch.testing.assert_close(outputs[0], output, atol=0.0, rtol=0.0)
+            combine_outputs[combine_dtype] = outputs[0]
+        finally:
+            layer.destroy()
+
+    bf16 = combine_outputs["bf16"].float()
+    nvfp4 = combine_outputs["nvfp4"].float()
+    rel_l2 = torch.linalg.vector_norm(nvfp4 - bf16) / torch.linalg.vector_norm(bf16)
+    assert rel_l2.item() < 0.15

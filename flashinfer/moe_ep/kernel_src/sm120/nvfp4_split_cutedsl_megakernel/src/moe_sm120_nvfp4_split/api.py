@@ -23,7 +23,7 @@ from .jit_config import Sm120JitConfig
 
 
 # Bump when a generated-kernel ABI or opaque workspace layout changes.
-KERNEL_CACHE_ABI = 3
+KERNEL_CACHE_ABI = 4
 
 
 @dataclass(frozen=True)
@@ -73,8 +73,7 @@ class MegaMoEProblemSpec:
             raise ValueError("num_topk cannot exceed num_total_experts")
         if self.hidden % 32 or self.intermediate % 64:
             raise ValueError(
-                "SM120 NVFP4 requires hidden % 32 == 0 and "
-                "intermediate % 64 == 0"
+                "SM120 NVFP4 requires hidden % 32 == 0 and intermediate % 64 == 0"
             )
         if self.gate_up_clamp is not None and self.gate_up_clamp < 0:
             raise ValueError("gate_up_clamp must be non-negative")
@@ -90,6 +89,7 @@ class SplitKernelBuildOptions:
     concurrent_k1_k2: bool = True
     k1_active_clusters: Optional[int] = None
     k2_active_clusters: Optional[int] = None
+    combine_format: str = "bf16"
 
     def validate(self) -> None:
         if self.flag_batch <= 0:
@@ -100,6 +100,11 @@ class SplitKernelBuildOptions:
         ):
             if value is not None and value <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.combine_format not in ("bf16", "16e2m1xbf16"):
+            raise ValueError(
+                "combine_format must be 'bf16' or '16e2m1xbf16', got "
+                f"{self.combine_format!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -138,10 +143,7 @@ class MegaMoECompileSpec:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-        return (
-            f"sm120-nvfp4-split-v{KERNEL_CACHE_ABI}-"
-            f"{sha256(payload).hexdigest()}"
-        )
+        return f"sm120-nvfp4-split-v{KERNEL_CACHE_ABI}-{sha256(payload).hexdigest()}"
 
 
 @dataclass(frozen=True)
@@ -199,6 +201,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     import cutlass
 
     from common.megamoe_constants import SfPaddingBlock
+    from src.token_comm import CombineFormat
     from .kernel_dispatch_fc1 import build_sm120_dispatch_fc1_kernel
     from .kernel_fc2_combine import Sm120Fc2CombineKernel
     from .sm120_mma import CTA_TOKEN_TILE
@@ -206,6 +209,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     problem = spec.problem
     config = spec.kernel
     options = spec.build
+    combine_format = CombineFormat.parse(options.combine_format)
     cluster_size = 1
     k1_clusters = options.k1_active_clusters or config.k1_sms // cluster_size
     k2_clusters = options.k2_active_clusters or config.k2_sms // cluster_size
@@ -246,7 +250,10 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         hidden=problem.hidden,
         comm_backend=config.kernel_comm_backend,
         ibgda_dispatch_chunk_tokens=config.dispatch_chunk_tokens,
+        # FC2 accumulation/output semantics remain BF16. ``combine_format``
+        # independently describes the optional low-precision wire encoding.
         fc2_output_dtype=cutlass.BFloat16,
+        combine_format=combine_format,
         token_back_mode=config.token_back_mode,
         apply_topk_in_fc1=False,
         gate_up_clamp=problem.gate_up_clamp,
