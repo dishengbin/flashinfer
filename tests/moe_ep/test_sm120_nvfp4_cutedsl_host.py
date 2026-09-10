@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +18,6 @@ from flashinfer.moe_ep.backends.mega.kernel.sm120.nvfp4_nvfp4_bf16_cutedsl impor
     Sm120_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 )
 from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import (
-    bootstrap_paths,
     select_graph_compile_bucket,
 )
 from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel.shim.weights import (
@@ -43,6 +45,127 @@ def test_config_rejects_unknown_combine_dtype() -> None:
                 combine_dtype="fp8",  # type: ignore[arg-type]
             )
         )
+
+
+def test_rank_local_combine_remains_opt_in() -> None:
+    # Importing api activates architecture-specific top-level modules. Keep
+    # this specialization check isolated from the other backends' host tests.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+            from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import bootstrap_paths
+            bootstrap_paths()
+            from moe_sm120_nvfp4_split.api import MegaMoEProblemSpec, select_compile_spec
+            from moe_sm120_nvfp4_split.heuristic import MegaMoEHeuristicOverrides
+            problem = MegaMoEProblemSpec(
+                tokens_per_rank=6045, num_topk=8, num_total_experts=128,
+                hidden=6144, intermediate=4608, expert_parallel_size=4,
+                expert_parallel_rank=0,
+            )
+            options = dict(
+                problem=problem, ep_same_numa_peer_count=3, ep_cross_numa_peer_count=0,
+                num_sms=148, sm_min_partition=4, sm_partition_alignment=4,
+            )
+            default = select_compile_spec(**options)
+            assert default.kernel.dispatch_rank_cache
+            assert not default.kernel.rank_local_combine
+            explicit = select_compile_spec(
+                **options, overrides=MegaMoEHeuristicOverrides(rank_local_combine=True)
+            )
+            assert explicit.kernel.rank_local_combine
+            import pytest
+            from moe_sm120_nvfp4_split.api import SplitKernelBuildOptions
+            with pytest.raises(ValueError, match="requires BF16 combine"):
+                select_compile_spec(
+                    **options,
+                    overrides=MegaMoEHeuristicOverrides(rank_local_combine=True),
+                    build=SplitKernelBuildOptions(combine_format="16e2m1xbf16"),
+                )
+        """),
+        ],
+        check=True,
+    )
+
+
+def test_k1_pipeline_stages_are_independent_and_cacheable() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+            import pytest
+            from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import bootstrap_paths
+            bootstrap_paths()
+            from moe_sm120_nvfp4_split.api import MegaMoEProblemSpec, select_compile_spec
+            from moe_sm120_nvfp4_split.heuristic import MegaMoEHeuristicOverrides
+            from moe_sm120_nvfp4_split.jit_config import Sm120JitConfig
+            problem = MegaMoEProblemSpec(
+                tokens_per_rank=6045, num_topk=8, num_total_experts=128,
+                hidden=6144, intermediate=4608, expert_parallel_size=4,
+                expert_parallel_rank=0,
+            )
+            options = dict(
+                problem=problem, ep_same_numa_peer_count=3, ep_cross_numa_peer_count=0,
+                num_sms=110, sm_min_partition=4, sm_partition_alignment=4,
+            )
+            automatic = select_compile_spec(**options)
+            assert automatic.kernel.k1_stages is None
+            explicit = select_compile_spec(
+                **options,
+                overrides=MegaMoEHeuristicOverrides(rank_local_combine=True, k1_stages=5, k2_stages=3),
+            )
+            assert explicit.cache_key != automatic.cache_key
+            assert explicit.jit == Sm120JitConfig()
+            assert explicit.kernel.k1_stages == 5
+            assert explicit.kernel.k2_stages == 3
+            assert not explicit.jit.enable_globaltimer
+            assert not explicit.jit.enable_k2_tile_trace
+            shallow_k2 = select_compile_spec(
+                **options, overrides=MegaMoEHeuristicOverrides(rank_local_combine=True, k1_stages=5, k2_stages=2)
+            )
+            assert shallow_k2.kernel.k2_stages == automatic.kernel.k2_stages
+            assert shallow_k2.cache_key != explicit.cache_key
+            with pytest.raises(ValueError, match="requires rank_local_combine"):
+                select_compile_spec(
+                    **options, overrides=MegaMoEHeuristicOverrides(k1_stages=5)
+                )
+            tuned = select_compile_spec(
+                **options, overrides=MegaMoEHeuristicOverrides(rank_local_combine=True)
+            )
+            assert (tuned.kernel.k1_stages, tuned.kernel.k2_stages) == (5, 4)
+            assert (tuned.kernel.dispatch_warps, tuned.kernel.ready_queue_bundle) == (1, 12)
+            pinned = select_compile_spec(
+                **options,
+                overrides=MegaMoEHeuristicOverrides(
+                    rank_local_combine=True, k1_stages=2, k2_stages=2,
+                    dispatch_warps=4, ready_queue_bundle=4,
+                ),
+            )
+            assert (pinned.kernel.k1_stages, pinned.kernel.k2_stages) == (2, 2)
+            assert (pinned.kernel.dispatch_warps, pinned.kernel.ready_queue_bundle) == (4, 4)
+            from dataclasses import replace
+            for tokens in (2559, 11896):
+                outside = select_compile_spec(
+                    **dict(options, problem=replace(problem, tokens_per_rank=tokens)),
+                    overrides=MegaMoEHeuristicOverrides(rank_local_combine=True),
+                )
+                assert outside.kernel.k1_stages is None
+            outside = select_compile_spec(
+                **dict(options, num_sms=148),
+                overrides=MegaMoEHeuristicOverrides(rank_local_combine=True),
+            )
+            assert outside.kernel.k1_stages is None
+            for stages in (0, -1):
+                with pytest.raises(ValueError, match="k1_stages must be positive"):
+                    select_compile_spec(
+                        **options, overrides=MegaMoEHeuristicOverrides(k1_stages=stages)
+                    )
+        """),
+        ],
+        check=True,
+    )
 
 
 def test_gate_up_interleave_is_grouped_in_sixteen_rows() -> None:
@@ -81,19 +204,25 @@ def test_decode_graph_compile_bucket_selection() -> None:
 
 
 def test_combine_reduce_flattens_large_token_grid() -> None:
-    bootstrap_paths()
-    from moe_sm120_nvfp4_split.kernel_combine_reduce import (
-        _topk_reduce_launch_geometry,
+    # The raw SM120 modules share names with SM100; isolate this import so
+    # the workspace-teardown contract below can load its own staging tree.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+            from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import bootstrap_paths
+            bootstrap_paths()
+            from moe_sm120_nvfp4_split.kernel_combine_reduce import _topk_reduce_launch_geometry
+            hidden_blocks, grid = _topk_reduce_launch_geometry(
+                tokens=81450, hidden=6144, threads=512,
+            )
+            assert hidden_blocks == 2
+            assert grid == [162900, 1, 1]
+        """),
+        ],
+        check=True,
     )
-
-    hidden_blocks, grid = _topk_reduce_launch_geometry(
-        tokens=81450,
-        hidden=6144,
-        threads=512,
-    )
-
-    assert hidden_blocks == 2
-    assert grid == [162900, 1, 1]
 
 
 def test_workspace_pool_key_covers_nvfp4_contract(monkeypatch) -> None:

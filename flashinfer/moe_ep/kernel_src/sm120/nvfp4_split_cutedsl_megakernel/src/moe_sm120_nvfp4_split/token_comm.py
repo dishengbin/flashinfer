@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
 
 from .moe_utils import spin_wait
 from .sm120_ptx_helpers import (
+    atomic_cas_gpu_i32_raw,
     lds_b32_raw,
     red_add_relaxed_sys_v2_bf16x2_raw,
     st_release_sys_u64_raw,
@@ -57,6 +58,8 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         num_dispatch_warps: int = 4,
         dispatch_warps_per_tile: int = 4,
         dispatch_compute_overlap: bool = True,
+        dispatch_rank_cache: bool = False,
+        rank_local_combine: bool = False,
         streaming_fc12: bool = False,
         k1_ready_queue: bool = False,
         k1_ready_queue_m_tiles: int = 1,
@@ -133,6 +136,8 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         self.dispatch_pull_mode = dispatch_pull_mode
         self.dispatch_warps_per_tile = dispatch_warps_per_tile
         self.dispatch_compute_overlap = dispatch_compute_overlap
+        self.dispatch_rank_cache = dispatch_rank_cache
+        self.rank_local_combine = rank_local_combine
         self.streaming_fc12 = streaming_fc12
         self.k1_ready_queue = k1_ready_queue
         self.k1_ready_queue_m_tiles = k1_ready_queue_m_tiles
@@ -430,6 +435,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         k1_ready_queue_ready,
         k1_ready_queue_state,
         token_src_metadata,
+        dispatch_rank_cache_state,
+        dispatch_rank_cache_sf_axis,
+        rank_combine_route_map,
         peer_rank_ptr_mapper,
         sm_idx,
         warp_idx,
@@ -455,6 +463,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 k1_ready_queue_ready,
                 k1_ready_queue_state,
                 token_src_metadata,
+                dispatch_rank_cache_state,
+                dispatch_rank_cache_sf_axis,
+                rank_combine_route_map,
                 peer_rank_ptr_mapper,
                 sm_idx,
                 warp_idx,
@@ -498,6 +509,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             k1_ready_queue_ready,
             k1_ready_queue_state,
             token_src_metadata,
+            dispatch_rank_cache_state,
+            dispatch_rank_cache_sf_axis,
+            rank_combine_route_map,
             peer_rank_ptr_mapper,
             sm_idx,
             warp_idx,
@@ -524,6 +538,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
         k1_ready_queue_ready,
         k1_ready_queue_state,
         token_src_metadata,
+        dispatch_rank_cache_state,
+        dispatch_rank_cache_sf_axis,
+        rank_combine_route_map,
         peer_rank_ptr_mapper,
         sm_idx,
         warp_idx,
@@ -728,6 +745,44 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     expert_pool_block_offset * Int32(self.token_padding_block)
                     + token_idx_in_expert
                 )
+                source_token_key = (
+                    current_rank_in_expert_idx
+                    * Int32(self.max_tokens_per_rank)
+                    + src_token
+                )
+                if cutlass.const_expr(self.rank_local_combine):
+                    if lane_idx == Int32(0):
+                        rank_combine_route_map[
+                            source_token_key, src_topk
+                        ] = pool_token_idx
+                cache_key = Int32(0)
+                cache_old = Int32(0)
+                cache_owner = Int32(0)
+                cache_master_pool = Int32(0)
+                cache_master_sf_axis = Int32(0)
+                if cutlass.const_expr(
+                    self.dispatch_rank_cache
+                    and self.comm_backend == "p2p_direct"
+                ):
+                    cache_key = source_token_key
+                    if lane_idx == Int32(0):
+                        cache_old = atomic_cas_gpu_i32_raw(
+                            (dispatch_rank_cache_state.iterator + cache_key).toint(),
+                            Int32(0),
+                            -(pool_token_idx + Int32(1)),
+                        )
+                    cache_old = cute.arch.shuffle_sync(cache_old, offset=0)
+                    if cache_old == Int32(0):
+                        cache_owner = Int32(1)
+                    elif cache_old > Int32(0):
+                        cache_master_pool = cache_old - Int32(1)
+                        if lane_idx == Int32(0):
+                            cache_master_sf_axis = dispatch_rank_cache_sf_axis[
+                                cache_key
+                            ]
+                        cache_master_sf_axis = cute.arch.shuffle_sync(
+                            cache_master_sf_axis, offset=0
+                        )
                 sf_passes: cutlass.Constexpr[int] = (
                     self.sf_uint32_per_token + 31
                 ) // 32
@@ -842,17 +897,24 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     inp_tok_local_base = input_token_buffer.iterator.toint()
                     inp_sf_local_base = input_sf_buffer.iterator.toint()
                     inp_w_local_base = input_topk_weights_buffer.iterator.toint()
+                    tma_src_addr = (
+                        inp_tok_local_base
+                        + cur_peer_offset
+                        + Int64(src_token * Int32(self.hidden_bytes))
+                    )
+                    if cache_old > Int32(0):
+                        tma_src_addr = (
+                            fc1_input_token_buffer.iterator.toint()
+                            + Int64(
+                                cache_master_pool * Int32(self.hidden_bytes)
+                            )
+                        )
                     with cute.arch.elect_one():
                         pull_buffer_warp_ptr = pull_buffer_ptr + (
                             warp_idx * Int32(self.hidden_bytes)
                         )
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             mbar_ptr_warp, Int32(self.hidden_bytes)
-                        )
-                        tma_src_addr = (
-                            inp_tok_local_base
-                            + cur_peer_offset
-                            + Int64(src_token * Int32(self.hidden_bytes))
                         )
                         tma_load_1d_raw(
                             pull_buffer_warp_ptr,
@@ -865,19 +927,29 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     for i in cutlass.range_constexpr(0, sf_passes, 1):
                         j = Int32(i * self.warp_threads) + lane_idx
                         if j < Int32(self.sf_uint32_per_token):
-                            sf_addr = (
-                                inp_sf_local_base
-                                + cur_peer_offset
-                                + Int64(
-                                    (
-                                        src_token
-                                        * Int32(self.sf_uint32_per_token)
-                                        + j
-                                    )
-                                    * Int32(4)
+                            sf_value = Int32(0)
+                            if cache_old > Int32(0):
+                                cached_sf_pos = sf_atom_int32_offset(
+                                    cache_master_sf_axis,
+                                    j,
+                                    num_k_atoms=self.sf_uint32_per_token,
                                 )
-                            )
-                            sf_vals[i] = ldg_b32_raw(sf_addr)
+                                sf_value = fc1_input_sf_buffer[cached_sf_pos]
+                            else:
+                                sf_addr = (
+                                    inp_sf_local_base
+                                    + cur_peer_offset
+                                    + Int64(
+                                        (
+                                            src_token
+                                            * Int32(self.sf_uint32_per_token)
+                                            + j
+                                        )
+                                        * Int32(4)
+                                    )
+                                )
+                                sf_value = ldg_b32_raw(sf_addr)
+                            sf_vals[i] = sf_value
                     if lane_idx == Int32(0):
                         weight_addr = (
                             inp_w_local_base
@@ -940,6 +1012,19 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                     with cute.arch.elect_one():
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0)
+
+                    cute.arch.sync_warp()
+                    if cutlass.const_expr(self.dispatch_rank_cache):
+                        if cache_owner != Int32(0) and lane_idx == Int32(0):
+                            dispatch_rank_cache_sf_axis[cache_key] = (
+                                sf_token_in_pool_axis
+                            )
+                            cute.arch.store(
+                                dispatch_rank_cache_state.iterator + cache_key,
+                                pool_token_idx + Int32(1),
+                                sem="release",
+                                scope="gpu",
+                            )
 
                 if _iket_pull_emit:
                     _iket.range_pop()  # Pull.TMA_NVLink_Roundtrip
@@ -1866,6 +1951,36 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                 num_sms=token_comm_args.sm_count,
             )
 
+            if cutlass.const_expr(self.rank_local_combine):
+                # One source thread owns each token. Publish immutable counts
+                # before the existing dispatch barrier; K2 can then recognize
+                # the last contributor without waiting for unrelated routes.
+                token = (
+                    cta_linear_id * Int32(self.num_dispatch_threads)
+                    + local_warp_idx * Int32(32)
+                    + lane_idx
+                )
+                stride = Int32(token_comm_args.sm_count * self.num_dispatch_threads)
+                while token < Int32(self.max_tokens_per_rank):
+                    for dst in cutlass.range_constexpr(self.world_size):
+                        count = Int32(0)
+                        for slot in cutlass.range_constexpr(self.num_topk):
+                            expert = Int32(token_comm_args.topk_idx[token, slot])
+                            if expert >= Int32(
+                                dst * self.num_experts_per_rank
+                            ) and expert < Int32((dst + 1) * self.num_experts_per_rank):
+                                count += Int32(1)
+                        key = Int32(self.local_rank * self.max_tokens_per_rank) + token
+                        peer_count = (
+                            token_comm_args.peer_rank_ptr_mapper.ptr_map_to_rank(
+                                token_comm_args.fc2_done_counter.iterator + key,
+                                Int32(dst),
+                            )
+                        )
+                        peer_count.store(count)
+                    token += stride
+                cute.arch.fence_acq_rel_sys()
+
         if iket_active:
             _iket.range_pop()
             _iket.range_push("Dispatch_Barrier")
@@ -1915,6 +2030,9 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             k1_ready_queue_ready,
             k1_ready_queue_state,
             token_comm_args.token_src_metadata,
+            token_comm_args.fc2_output_workspace,
+            token_comm_args.fc2_output_sf,
+            token_comm_args.combine_sf,
             token_comm_args.peer_rank_ptr_mapper,
             cta_linear_id,
             local_warp_idx,

@@ -47,6 +47,7 @@ from .sm120_mma import (
 from .split_timestamp import (
     FIELD_FIRST_WORK,
     FIELD_FIRST_TILE_ID,
+    FIELD_DISPATCH_WARP_NS,
     FIELD_KERNEL_ENTRY,
     FIELD_KERNEL_EXIT,
     FIELD_LAST_WORK,
@@ -261,7 +262,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
         self.tma_b_warp_id = self.sm120_tma_b_warp_id
         self.sched_warp_id = self.sm120_sched_warp_id
         # Installed by token-comm subclasses.
-        self.dispatch_warp_id: Optional[Tuple[int, int, int, int]] = None
+        self.dispatch_warp_id: Optional[Tuple[int, ...]] = None
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_standalone: bool = False
         self.threads_per_cta = 32 * len(
@@ -287,6 +288,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
         self.epi_reg_cnt = 256
         self.task_reg_cnt = 72
         self.use_warpgroup_reg_realloc = True
+        self.compact_k1 = False
 
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
         self.num_tmem_alloc_cols = 0
@@ -3221,13 +3223,15 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         sFc2ReadySlot = storage.sFc2ReadySlot.get_tensor(cute.make_layout(2))
-        # Two N8 accumulator groups share one N16 x downproj32 FP32 reduction
-        # tile. The FC2-only specialization does not materialize these views.
+        # Store all tokens' four warp-local maxima in the existing 512-float
+        # allocation. N <= 128 fits without extra SMEM, and the dense stride
+        # avoids mapping different tokens to the same shared-memory bank.
+        # The FC2-only specialization does not materialize these views.
         if cutlass.const_expr(self.scheduler_phase_mode != "fc2"):
             sFc1Swiglu = fc1_epilogue_storage.sFc1Swiglu.get_tensor(
                 cute.make_layout(
-                    (16, self.mma_tiler[0] // 2),
-                    stride=(self.mma_tiler[0] // 2, 1),
+                    (self.mma_tiler[1], 4),
+                    stride=(4, 1),
                 )
             )
             sFc1OutputStaged = fc1_epilogue_storage.sFc1Output.get_tensor(
@@ -3241,7 +3245,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
             # the constant-false FC1 path is removed before SASS emission.
             sFc1Swiglu = cute.make_tensor(
                 cute.recast_ptr(sA.iterator, dtype=cutlass.Float32),
-                cute.make_layout((16, self.mma_tiler[0] // 2)),
+                cute.make_layout((self.mma_tiler[1], 4), stride=(4, 1)),
             )
             sFc1OutputStaged = cute.make_tensor(
                 sA.iterator, fc1_output_smem_layout_staged.outer
@@ -4480,195 +4484,367 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                     peek_a_full_status = a_consumer.try_wait()
                     peek_b_full_status = b_consumer.try_wait()
 
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    trace_k_detail = cutlass.Int32(0)
-                    if trace_compute_detail != cutlass.Int32(0):
-                        if trace_all_k_detail != cutlass.Int32(0):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile < cutlass.Int32(2):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(11):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(12):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(23):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile == cutlass.Int32(24):
-                            trace_k_detail = cutlass.Int32(1)
-                        if k_tile + cutlass.Int32(2) >= k_tile_cnt:
-                            trace_k_detail = cutlass.Int32(1)
-
-                    if trace_k_detail != cutlass.Int32(0):
-                        if is_phase_linear1:
-                            iket.range_push("sm120_fc1_wait_a")
-                        else:
-                            iket.range_push("sm120_fc2_wait_a")
-                    k2_trace_a_wait_start = cutlass.Int64(0)
-                    k2_trace_a_wait_active = cutlass.Boolean(0)
-                    if cutlass.const_expr(green_trace is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            if lane_idx == cutlass.Int32(0):
-                                if peek_a_full_status == cutlass.Boolean(0):
-                                    k2_trace_tma_a_wait_calls += cutlass.Int64(1)
-                                    if (
-                                        (
-                                            k_tile
-                                            + fc2_detail_tiles_seen
-                                            + cta_linear_id
-                                        )
-                                        % cutlass.Int32(
-                                            TRACE_TMA_WAIT_SAMPLE_STRIDE
-                                        )
-                                        == cutlass.Int32(0)
-                                    ):
-                                        k2_trace_a_wait_start = read_globaltimer()
-                                        k2_trace_a_wait_active = cutlass.Boolean(1)
-                                        k2_trace_tma_a_timed_calls += (
-                                            cutlass.Int64(1)
-                                        )
-                    handle_a = a_consumer.wait_and_advance(peek_a_full_status)
-                    if cutlass.const_expr(green_trace is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            if lane_idx == cutlass.Int32(0):
-                                if k2_trace_a_wait_active:
-                                    k2_trace_tma_a_wait_ns += (
-                                        read_globaltimer()
-                                        - k2_trace_a_wait_start
-                                    )
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
-                        if is_phase_linear1:
-                            iket.range_push("sm120_fc1_wait_b")
-                        else:
-                            iket.range_push("sm120_fc2_wait_b")
-                    k2_trace_b_wait_start = cutlass.Int64(0)
-                    k2_trace_b_wait_active = cutlass.Boolean(0)
-                    if cutlass.const_expr(green_trace is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            if lane_idx == cutlass.Int32(0):
-                                if peek_b_full_status == cutlass.Boolean(0):
-                                    k2_trace_tma_b_wait_calls += cutlass.Int64(1)
-                                    if (
-                                        (
-                                            k_tile
-                                            + fc2_detail_tiles_seen
-                                            + cta_linear_id
-                                        )
-                                        % cutlass.Int32(
-                                            TRACE_TMA_WAIT_SAMPLE_STRIDE
-                                        )
-                                        == cutlass.Int32(0)
-                                    ):
-                                        k2_trace_b_wait_start = read_globaltimer()
-                                        k2_trace_b_wait_active = cutlass.Boolean(1)
-                                        k2_trace_tma_b_timed_calls += (
-                                            cutlass.Int64(1)
-                                        )
-                    handle_b = b_consumer.wait_and_advance(peek_b_full_status)
-                    if cutlass.const_expr(green_trace is not None):
-                        if compute_warp == cutlass.Int32(0):
-                            if lane_idx == cutlass.Int32(0):
-                                if k2_trace_b_wait_active:
-                                    k2_trace_tma_b_wait_ns += (
-                                        read_globaltimer()
-                                        - k2_trace_b_wait_start
-                                    )
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
-                    peek_a_full_status = cutlass.Boolean(1)
-                    peek_b_full_status = cutlass.Boolean(1)
-                    if handle_a.count + 1 < k_tile_cnt:
-                        peek_a_full_status = a_consumer.try_wait()
-                    if handle_b.count + 1 < k_tile_cnt:
-                        peek_b_full_status = b_consumer.try_wait()
-
-                    tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
-                    tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
-                    tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
-                    tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
-                    sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
-                        self.mma_tiler_sfa[0] // self.mma_tiler[0]
-                    )
-                    # partition_fragment_SFA packs the two M64 groups of the
-                    # staged M128 scale tile eight bytes apart. Select the
-                    # group in SMEM so the RMEM fragment is statically indexed.
-                    tCsSFA_selected = cute.make_tensor(
-                        tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
-                        tCsSFA_p.layout,
-                    )
-                    tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
-                    tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                    tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
-                    tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_copy_view)
-                    cute.copy(
-                        smem_tiled_copy_A,
-                        tCsA_p[None, None, 0],
-                        tCrA_copy_view[None, None, 0],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_B,
-                        tCsB_p[None, None, 0],
-                        tCrB_copy_view[None, None, 0],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_SFA,
-                        tCsSFA_p_filtered[None, None, 0],
-                        tCrSFA_copy_view_filtered[None, None, 0],
-                    )
-                    cute.copy(
-                        smem_tiled_copy_SFB,
-                        tCsSFB_p_filtered[None, None, 0],
-                        tCrSFB_copy_view_filtered[None, 0, None, 0],
-                    )
+                if cutlass.const_expr(self.compact_k1):
+                    # Two K64 fragments let the next K128 tile's first loads
+                    # overlap the current tile's second MMA. Release SMEM
+                    # only after every lane has copied both fragments, and
+                    # peel the final tile to avoid a reload branch per step.
                     tCrSFB_mma_lo = tCrSFB
                     tCrSFB_mma_hi = tCrSFB
                     sfb_tile_is_hi = cutlass.Boolean(0)
                     if cutlass.const_expr(self.mma_tiler[1] < 128):
-                        # Keep the N64 half selection static in RMEM. A dynamic
-                        # iterator offset forces ptxas to materialize the full
-                        # N128 SFB fragment in local memory.
                         tCrSFB_mma_hi = cute.make_tensor(
-                            tCrSFB.iterator + n_groups // 4,
-                            tCrSFB.layout,
+                            tCrSFB.iterator + n_groups // 4, tCrSFB.layout
                         )
                         sfb_tiles_per_tma = 128 // self.mma_tiler[1]
-                        sfb_tile_is_hi = (
-                            work_tile_info.tile_n_idx
-                            % cutlass.Int32(sfb_tiles_per_tma)
+                        sfb_tile_is_hi = work_tile_info.tile_n_idx % cutlass.Int32(
+                            sfb_tiles_per_tma
                         ) != cutlass.Int32(0)
-
-                    if trace_k_detail != cutlass.Int32(0):
-                        if is_phase_linear1:
-                            iket.range_push("sm120_fc1_k128_compute")
-                        else:
-                            iket.range_push("sm120_fc2_k128_compute")
-                    for k_inner_mma in cutlass.range_constexpr(0, 2):
-                        if cutlass.const_expr(k_inner_mma + 1 < 2):
-                            k_inner_next = k_inner_mma + 1
+                    if k_tile_cnt > 0:
+                        stage_ready = peek_a_full_status
+                        wait_start = cutlass.Int64(0)
+                        time_wait = cutlass.Boolean(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if stage_ready == cutlass.Boolean(0):
+                                        k2_trace_tma_a_wait_calls += cutlass.Int64(1)
+                                        if (
+                                            cutlass.Int32(0)
+                                            + fc2_detail_tiles_seen
+                                            + cta_linear_id
+                                        ) % cutlass.Int32(
+                                            TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                        ) == cutlass.Int32(0):
+                                            wait_start = read_globaltimer()
+                                            time_wait = cutlass.Boolean(1)
+                                            k2_trace_tma_a_timed_calls += cutlass.Int64(
+                                                1
+                                            )
+                        handle_a = a_consumer.wait_and_advance(stage_ready)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if time_wait:
+                                        k2_trace_tma_a_wait_ns += (
+                                            read_globaltimer() - wait_start
+                                        )
+                        stage_ready = peek_b_full_status
+                        wait_start = cutlass.Int64(0)
+                        time_wait = cutlass.Boolean(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if stage_ready == cutlass.Boolean(0):
+                                        k2_trace_tma_b_wait_calls += cutlass.Int64(1)
+                                        if (
+                                            cutlass.Int32(0)
+                                            + fc2_detail_tiles_seen
+                                            + cta_linear_id
+                                        ) % cutlass.Int32(
+                                            TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                        ) == cutlass.Int32(0):
+                                            wait_start = read_globaltimer()
+                                            time_wait = cutlass.Boolean(1)
+                                            k2_trace_tma_b_timed_calls += cutlass.Int64(
+                                                1
+                                            )
+                        handle_b = b_consumer.wait_and_advance(stage_ready)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if time_wait:
+                                        k2_trace_tma_b_wait_ns += (
+                                            read_globaltimer() - wait_start
+                                        )
+                        tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                        tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                        tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
+                        tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
+                        sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                            self.mma_tiler_sfa[0] // self.mma_tiler[0]
+                        )
+                        tCsSFA_selected = cute.make_tensor(
+                            tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                            tCsSFA_p.layout,
+                        )
+                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                        tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_copy_view)
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tCsA_p[None, None, 0],
+                            tCrA_copy_view[None, None, 0],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_B,
+                            tCsB_p[None, None, 0],
+                            tCrB_copy_view[None, None, 0],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_SFA,
+                            tCsSFA_p_filtered[None, None, 0],
+                            tCrSFA_copy_view_filtered[None, None, 0],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_SFB,
+                            tCsSFB_p_filtered[None, None, 0],
+                            tCrSFB_copy_view_filtered[None, 0, None, 0],
+                        )
+                        for k_tile in cutlass.range(0, k_tile_cnt - 1, 1, unroll=1):
+                            tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                            tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                            tCsSFA_p = tCsSFA_copy_view[
+                                None, None, None, handle_a.index
+                            ]
+                            tCsSFB_p = tCsSFB_copy_view[
+                                None, None, None, handle_b.index
+                            ]
+                            sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                                self.mma_tiler_sfa[0] // self.mma_tiler[0]
+                            )
+                            tCsSFA_selected = cute.make_tensor(
+                                tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                                tCsSFA_p.layout,
+                            )
+                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                            tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                            tCrSFA_copy_view_filtered = cute.filter_zeros(
+                                tCrSFA_copy_view
+                            )
+                            tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                tCrSFB_copy_view
+                            )
                             cute.copy(
                                 smem_tiled_copy_A,
-                                tCsA_p[None, None, k_inner_next],
-                                tCrA_copy_view[None, None, k_inner_next],
+                                tCsA_p[None, None, 1],
+                                tCrA_copy_view[None, None, 1],
                             )
                             cute.copy(
                                 smem_tiled_copy_B,
-                                tCsB_p[None, None, k_inner_next],
-                                tCrB_copy_view[None, None, k_inner_next],
+                                tCsB_p[None, None, 1],
+                                tCrB_copy_view[None, None, 1],
                             )
                             cute.copy(
                                 smem_tiled_copy_SFA,
-                                tCsSFA_p_filtered[None, None, k_inner_next],
-                                tCrSFA_copy_view_filtered[
-                                    None, None, k_inner_next
-                                ],
+                                tCsSFA_p_filtered[None, None, 1],
+                                tCrSFA_copy_view_filtered[None, None, 1],
                             )
                             cute.copy(
                                 smem_tiled_copy_SFB,
-                                tCsSFB_p_filtered[None, None, k_inner_next],
-                                tCrSFB_copy_view_filtered[
-                                    None, 0, None, k_inner_next
-                                ],
+                                tCsSFB_p_filtered[None, None, 1],
+                                tCrSFB_copy_view_filtered[None, 0, None, 1],
                             )
+                            for ng in cutlass.range_constexpr(0, n_groups):
+                                if sfb_tile_is_hi:
+                                    issue_m64n8k64_nvfp4(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB_mma_hi,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        k_inner=0,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
+                                else:
+                                    issue_m64n8k64_nvfp4(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB_mma_lo,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        k_inner=0,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
+                            cute.arch.sync_warp()
+                            handle_a.release()
+                            handle_b.release()
+                            stage_ready = a_consumer.try_wait()
+                            wait_start = cutlass.Int64(0)
+                            time_wait = cutlass.Boolean(0)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if stage_ready == cutlass.Boolean(0):
+                                            k2_trace_tma_a_wait_calls += cutlass.Int64(
+                                                1
+                                            )
+                                            if (
+                                                k_tile
+                                                + cutlass.Int32(1)
+                                                + fc2_detail_tiles_seen
+                                                + cta_linear_id
+                                            ) % cutlass.Int32(
+                                                TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                            ) == cutlass.Int32(0):
+                                                wait_start = read_globaltimer()
+                                                time_wait = cutlass.Boolean(1)
+                                                k2_trace_tma_a_timed_calls += (
+                                                    cutlass.Int64(1)
+                                                )
+                            handle_a = a_consumer.wait_and_advance(stage_ready)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if time_wait:
+                                            k2_trace_tma_a_wait_ns += (
+                                                read_globaltimer() - wait_start
+                                            )
+                            stage_ready = b_consumer.try_wait()
+                            wait_start = cutlass.Int64(0)
+                            time_wait = cutlass.Boolean(0)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if stage_ready == cutlass.Boolean(0):
+                                            k2_trace_tma_b_wait_calls += cutlass.Int64(
+                                                1
+                                            )
+                                            if (
+                                                k_tile
+                                                + cutlass.Int32(1)
+                                                + fc2_detail_tiles_seen
+                                                + cta_linear_id
+                                            ) % cutlass.Int32(
+                                                TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                            ) == cutlass.Int32(0):
+                                                wait_start = read_globaltimer()
+                                                time_wait = cutlass.Boolean(1)
+                                                k2_trace_tma_b_timed_calls += (
+                                                    cutlass.Int64(1)
+                                                )
+                            handle_b = b_consumer.wait_and_advance(stage_ready)
+                            if cutlass.const_expr(green_trace is not None):
+                                if compute_warp == cutlass.Int32(0):
+                                    if lane_idx == cutlass.Int32(0):
+                                        if time_wait:
+                                            k2_trace_tma_b_wait_ns += (
+                                                read_globaltimer() - wait_start
+                                            )
+                            tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                            tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                            tCsSFA_p = tCsSFA_copy_view[
+                                None, None, None, handle_a.index
+                            ]
+                            tCsSFB_p = tCsSFB_copy_view[
+                                None, None, None, handle_b.index
+                            ]
+                            sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                                self.mma_tiler_sfa[0] // self.mma_tiler[0]
+                            )
+                            tCsSFA_selected = cute.make_tensor(
+                                tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                                tCsSFA_p.layout,
+                            )
+                            tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                            tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                            tCrSFA_copy_view_filtered = cute.filter_zeros(
+                                tCrSFA_copy_view
+                            )
+                            tCrSFB_copy_view_filtered = cute.filter_zeros(
+                                tCrSFB_copy_view
+                            )
+                            cute.copy(
+                                smem_tiled_copy_A,
+                                tCsA_p[None, None, 0],
+                                tCrA_copy_view[None, None, 0],
+                            )
+                            cute.copy(
+                                smem_tiled_copy_B,
+                                tCsB_p[None, None, 0],
+                                tCrB_copy_view[None, None, 0],
+                            )
+                            cute.copy(
+                                smem_tiled_copy_SFA,
+                                tCsSFA_p_filtered[None, None, 0],
+                                tCrSFA_copy_view_filtered[None, None, 0],
+                            )
+                            cute.copy(
+                                smem_tiled_copy_SFB,
+                                tCsSFB_p_filtered[None, None, 0],
+                                tCrSFB_copy_view_filtered[None, 0, None, 0],
+                            )
+                            for ng in cutlass.range_constexpr(0, n_groups):
+                                if sfb_tile_is_hi:
+                                    issue_m64n8k64_nvfp4(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB_mma_hi,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        k_inner=1,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
+                                else:
+                                    issue_m64n8k64_nvfp4(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB_mma_lo,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        k_inner=1,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
+                        tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                        tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                        tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
+                        tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
+                        sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                            self.mma_tiler_sfa[0] // self.mma_tiler[0]
+                        )
+                        tCsSFA_selected = cute.make_tensor(
+                            tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                            tCsSFA_p.layout,
+                        )
+                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                        tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_copy_view)
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tCsA_p[None, None, 1],
+                            tCrA_copy_view[None, None, 1],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_B,
+                            tCsB_p[None, None, 1],
+                            tCrB_copy_view[None, None, 1],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_SFA,
+                            tCsSFA_p_filtered[None, None, 1],
+                            tCrSFA_copy_view_filtered[None, None, 1],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_SFB,
+                            tCsSFB_p_filtered[None, None, 1],
+                            tCrSFB_copy_view_filtered[None, 0, None, 1],
+                        )
                         for ng in cutlass.range_constexpr(0, n_groups):
                             if sfb_tile_is_hi:
                                 issue_m64n8k64_nvfp4(
@@ -4681,7 +4857,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                     n_group=ng,
                                     active_n_groups=n_groups,
                                     sfa_m_group=0,
-                                    k_inner=k_inner_mma,
+                                    k_inner=0,
                                     a_dtype=self.a_dtype,
                                     b_dtype=self.b_dtype,
                                     sf_dtype=self.sf_dtype,
@@ -4697,15 +4873,262 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                     n_group=ng,
                                     active_n_groups=n_groups,
                                     sfa_m_group=0,
-                                    k_inner=k_inner_mma,
+                                    k_inner=0,
                                     a_dtype=self.a_dtype,
                                     b_dtype=self.b_dtype,
                                     sf_dtype=self.sf_dtype,
                                 )
-                    if trace_k_detail != cutlass.Int32(0):
-                        iket.range_pop()
-                    handle_a.release()
-                    handle_b.release()
+                        cute.arch.sync_warp()
+                        handle_a.release()
+                        handle_b.release()
+                        for ng in cutlass.range_constexpr(0, n_groups):
+                            if sfb_tile_is_hi:
+                                issue_m64n8k64_nvfp4(
+                                    tiled_mma,
+                                    accumulators[None, None, ng],
+                                    tCrA,
+                                    tCrB,
+                                    tCrSFA,
+                                    tCrSFB_mma_hi,
+                                    n_group=ng,
+                                    active_n_groups=n_groups,
+                                    sfa_m_group=0,
+                                    k_inner=1,
+                                    a_dtype=self.a_dtype,
+                                    b_dtype=self.b_dtype,
+                                    sf_dtype=self.sf_dtype,
+                                )
+                            else:
+                                issue_m64n8k64_nvfp4(
+                                    tiled_mma,
+                                    accumulators[None, None, ng],
+                                    tCrA,
+                                    tCrB,
+                                    tCrSFA,
+                                    tCrSFB_mma_lo,
+                                    n_group=ng,
+                                    active_n_groups=n_groups,
+                                    sfa_m_group=0,
+                                    k_inner=1,
+                                    a_dtype=self.a_dtype,
+                                    b_dtype=self.b_dtype,
+                                    sf_dtype=self.sf_dtype,
+                                )
+                else:
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        trace_k_detail = cutlass.Int32(0)
+                        if trace_compute_detail != cutlass.Int32(0):
+                            if trace_all_k_detail != cutlass.Int32(0):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile < cutlass.Int32(2):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile == cutlass.Int32(11):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile == cutlass.Int32(12):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile == cutlass.Int32(23):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile == cutlass.Int32(24):
+                                trace_k_detail = cutlass.Int32(1)
+                            if k_tile + cutlass.Int32(2) >= k_tile_cnt:
+                                trace_k_detail = cutlass.Int32(1)
+
+                        if trace_k_detail != cutlass.Int32(0):
+                            if is_phase_linear1:
+                                iket.range_push("sm120_fc1_wait_a")
+                            else:
+                                iket.range_push("sm120_fc2_wait_a")
+                        k2_trace_a_wait_start = cutlass.Int64(0)
+                        k2_trace_a_wait_active = cutlass.Boolean(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if peek_a_full_status == cutlass.Boolean(0):
+                                        k2_trace_tma_a_wait_calls += cutlass.Int64(1)
+                                        if (
+                                            k_tile
+                                            + fc2_detail_tiles_seen
+                                            + cta_linear_id
+                                        ) % cutlass.Int32(
+                                            TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                        ) == cutlass.Int32(0):
+                                            k2_trace_a_wait_start = read_globaltimer()
+                                            k2_trace_a_wait_active = cutlass.Boolean(1)
+                                            k2_trace_tma_a_timed_calls += cutlass.Int64(
+                                                1
+                                            )
+                        handle_a = a_consumer.wait_and_advance(peek_a_full_status)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if k2_trace_a_wait_active:
+                                        k2_trace_tma_a_wait_ns += (
+                                            read_globaltimer() - k2_trace_a_wait_start
+                                        )
+                        if trace_k_detail != cutlass.Int32(0):
+                            iket.range_pop()
+                            if is_phase_linear1:
+                                iket.range_push("sm120_fc1_wait_b")
+                            else:
+                                iket.range_push("sm120_fc2_wait_b")
+                        k2_trace_b_wait_start = cutlass.Int64(0)
+                        k2_trace_b_wait_active = cutlass.Boolean(0)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if peek_b_full_status == cutlass.Boolean(0):
+                                        k2_trace_tma_b_wait_calls += cutlass.Int64(1)
+                                        if (
+                                            k_tile
+                                            + fc2_detail_tiles_seen
+                                            + cta_linear_id
+                                        ) % cutlass.Int32(
+                                            TRACE_TMA_WAIT_SAMPLE_STRIDE
+                                        ) == cutlass.Int32(0):
+                                            k2_trace_b_wait_start = read_globaltimer()
+                                            k2_trace_b_wait_active = cutlass.Boolean(1)
+                                            k2_trace_tma_b_timed_calls += cutlass.Int64(
+                                                1
+                                            )
+                        handle_b = b_consumer.wait_and_advance(peek_b_full_status)
+                        if cutlass.const_expr(green_trace is not None):
+                            if compute_warp == cutlass.Int32(0):
+                                if lane_idx == cutlass.Int32(0):
+                                    if k2_trace_b_wait_active:
+                                        k2_trace_tma_b_wait_ns += (
+                                            read_globaltimer() - k2_trace_b_wait_start
+                                        )
+                        if trace_k_detail != cutlass.Int32(0):
+                            iket.range_pop()
+                        peek_a_full_status = cutlass.Boolean(1)
+                        peek_b_full_status = cutlass.Boolean(1)
+                        if handle_a.count + 1 < k_tile_cnt:
+                            peek_a_full_status = a_consumer.try_wait()
+                        if handle_b.count + 1 < k_tile_cnt:
+                            peek_b_full_status = b_consumer.try_wait()
+
+                        tCsA_p = tCsA_copy_view[None, None, None, handle_a.index]
+                        tCsB_p = tCsB_copy_view[None, None, None, handle_b.index]
+                        tCsSFA_p = tCsSFA_copy_view[None, None, None, handle_a.index]
+                        tCsSFB_p = tCsSFB_copy_view[None, None, None, handle_b.index]
+                        sfa_m_group = work_tile_info.tile_m_idx % cutlass.Int32(
+                            self.mma_tiler_sfa[0] // self.mma_tiler[0]
+                        )
+                        # partition_fragment_SFA packs the two M64 groups of the
+                        # staged M128 scale tile eight bytes apart. Select the
+                        # group in SMEM so the RMEM fragment is statically indexed.
+                        tCsSFA_selected = cute.make_tensor(
+                            tCsSFA_p.iterator + sfa_m_group * cutlass.Int32(8),
+                            tCsSFA_p.layout,
+                        )
+                        tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_selected)
+                        tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
+                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                        tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_copy_view)
+                        cute.copy(
+                            smem_tiled_copy_A,
+                            tCsA_p[None, None, 0],
+                            tCrA_copy_view[None, None, 0],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_B,
+                            tCsB_p[None, None, 0],
+                            tCrB_copy_view[None, None, 0],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_SFA,
+                            tCsSFA_p_filtered[None, None, 0],
+                            tCrSFA_copy_view_filtered[None, None, 0],
+                        )
+                        cute.copy(
+                            smem_tiled_copy_SFB,
+                            tCsSFB_p_filtered[None, None, 0],
+                            tCrSFB_copy_view_filtered[None, 0, None, 0],
+                        )
+                        tCrSFB_mma_lo = tCrSFB
+                        tCrSFB_mma_hi = tCrSFB
+                        sfb_tile_is_hi = cutlass.Boolean(0)
+                        if cutlass.const_expr(self.mma_tiler[1] < 128):
+                            # Keep the N64 half selection static in RMEM. A dynamic
+                            # iterator offset forces ptxas to materialize the full
+                            # N128 SFB fragment in local memory.
+                            tCrSFB_mma_hi = cute.make_tensor(
+                                tCrSFB.iterator + n_groups // 4,
+                                tCrSFB.layout,
+                            )
+                            sfb_tiles_per_tma = 128 // self.mma_tiler[1]
+                            sfb_tile_is_hi = (
+                                work_tile_info.tile_n_idx
+                                % cutlass.Int32(sfb_tiles_per_tma)
+                            ) != cutlass.Int32(0)
+
+                        if trace_k_detail != cutlass.Int32(0):
+                            if is_phase_linear1:
+                                iket.range_push("sm120_fc1_k128_compute")
+                            else:
+                                iket.range_push("sm120_fc2_k128_compute")
+                        for k_inner_mma in cutlass.range_constexpr(0, 2):
+                            if cutlass.const_expr(k_inner_mma + 1 < 2):
+                                k_inner_next = k_inner_mma + 1
+                                cute.copy(
+                                    smem_tiled_copy_A,
+                                    tCsA_p[None, None, k_inner_next],
+                                    tCrA_copy_view[None, None, k_inner_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_B,
+                                    tCsB_p[None, None, k_inner_next],
+                                    tCrB_copy_view[None, None, k_inner_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_SFA,
+                                    tCsSFA_p_filtered[None, None, k_inner_next],
+                                    tCrSFA_copy_view_filtered[None, None, k_inner_next],
+                                )
+                                cute.copy(
+                                    smem_tiled_copy_SFB,
+                                    tCsSFB_p_filtered[None, None, k_inner_next],
+                                    tCrSFB_copy_view_filtered[
+                                        None, 0, None, k_inner_next
+                                    ],
+                                )
+                            for ng in cutlass.range_constexpr(0, n_groups):
+                                if sfb_tile_is_hi:
+                                    issue_m64n8k64_nvfp4(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB_mma_hi,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        k_inner=k_inner_mma,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
+                                else:
+                                    issue_m64n8k64_nvfp4(
+                                        tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB_mma_lo,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfa_m_group=0,
+                                        k_inner=k_inner_mma,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
+                        if trace_k_detail != cutlass.Int32(0):
+                            iket.range_pop()
+                        handle_a.release()
+                        handle_b.release()
 
                 if cutlass.const_expr(green_trace is not None):
                     if compute_warp == cutlass.Int32(0):
@@ -4754,6 +5177,10 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                             fc1_norm_const[work_tile_info.expert_idx]
                         )
 
+                    # First retain SwiGLU values in the consumed accumulator
+                    # slots and publish all warp-local maxima. Keeping each
+                    # token's maxima distinct replaces per-N16 rendezvous with
+                    # one whole-tile barrier before quantization.
                     for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
                         acc0 = accumulators[None, None, ng_pair * 2]
                         acc1 = accumulators[None, None, ng_pair * 2 + 1]
@@ -4833,8 +5260,12 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                             val2 = cutlass.Float32(0.0)
                         if tile_token3 >= work_tile_info.valid_tokens_in_tile:
                             val3 = cutlass.Float32(0.0)
+                        acc0[0] = val0
+                        acc0[1] = val1
+                        acc1[0] = val2
+                        acc1[1] = val3
                         if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_push("sm120_fc1_epi_amax_reduce")
+                            iket.range_push("sm120_fc1_epi_amax_local")
                         amax0 = cute.math.absf(val0)
                         amax1 = cute.math.absf(val1)
                         amax2 = cute.math.absf(val2)
@@ -4854,16 +5285,47 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                                 amax3, cute.arch.shuffle_sync(amax3, peer_lane)
                             )
                         if lane_g == cutlass.Int32(0):
-                            sFc1Swiglu[token0, compute_warp] = amax0
-                            sFc1Swiglu[token1, compute_warp] = amax1
-                            sFc1Swiglu[token2, compute_warp] = amax2
-                            sFc1Swiglu[token3, compute_warp] = amax3
+                            sFc1Swiglu[tile_token0, compute_warp] = amax0
+                            sFc1Swiglu[tile_token1, compute_warp] = amax1
+                            sFc1Swiglu[tile_token2, compute_warp] = amax2
+                            sFc1Swiglu[tile_token3, compute_warp] = amax3
 
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=32 * len(self.compute_warp_id),
-                        )
+                        if trace_compute_detail != cutlass.Int32(0):
+                            iket.range_pop()
 
+                    if trace_compute_detail != cutlass.Int32(0):
+                        iket.range_push("sm120_fc1_epi_amax_sync")
+                    cute.arch.barrier(
+                        barrier_id=self.epilog_sync_bar_id,
+                        number_of_threads=32 * len(self.compute_warp_id),
+                    )
+                    if trace_compute_detail != cutlass.Int32(0):
+                        iket.range_pop()
+
+                    for ng_pair in cutlass.range_constexpr(0, n_groups // 2):
+                        acc0 = accumulators[None, None, ng_pair * 2]
+                        acc1 = accumulators[None, None, ng_pair * 2 + 1]
+
+                        token0 = lane_t * cutlass.Int32(2)
+                        token1 = token0 + cutlass.Int32(1)
+                        token2 = token0 + cutlass.Int32(MMA_N)
+                        token3 = token1 + cutlass.Int32(MMA_N)
+                        token_pair_base = cutlass.Int32(ng_pair * 2 * MMA_N)
+                        tile_token0 = token_pair_base + token0
+                        tile_token1 = token_pair_base + token1
+                        tile_token2 = token_pair_base + token2
+                        tile_token3 = token_pair_base + token3
+
+                        val0 = acc0[0]
+                        val1 = acc0[1]
+                        val2 = acc1[0]
+                        val3 = acc1[1]
+                        raw_token0 = tile_token_base + tile_token0
+                        raw_token1 = tile_token_base + tile_token1
+                        raw_token2 = tile_token_base + tile_token2
+                        raw_token3 = tile_token_base + tile_token3
+                        if trace_compute_detail != cutlass.Int32(0):
+                            iket.range_push("sm120_fc1_epi_amax_pair")
                         amax0 = cutlass.Float32(0.0)
                         amax1 = cutlass.Float32(0.0)
                         amax2 = cutlass.Float32(0.0)
@@ -4873,16 +5335,16 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                             for warp_offset in cutlass.range_constexpr(0, 2):
                                 warp = pair_first_warp + cutlass.Int32(warp_offset)
                                 amax0 = cute.arch.fmax(
-                                    amax0, sFc1Swiglu[token0, warp]
+                                    amax0, sFc1Swiglu[tile_token0, warp]
                                 )
                                 amax1 = cute.arch.fmax(
-                                    amax1, sFc1Swiglu[token1, warp]
+                                    amax1, sFc1Swiglu[tile_token1, warp]
                                 )
                                 amax2 = cute.arch.fmax(
-                                    amax2, sFc1Swiglu[token2, warp]
+                                    amax2, sFc1Swiglu[tile_token2, warp]
                                 )
                                 amax3 = cute.arch.fmax(
-                                    amax3, sFc1Swiglu[token3, warp]
+                                    amax3, sFc1Swiglu[tile_token3, warp]
                                 )
                         amax0 = cute.arch.shuffle_sync(amax0, lane_t)
                         amax1 = cute.arch.shuffle_sync(amax1, lane_t)
@@ -5005,14 +5467,16 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                         if trace_compute_detail != cutlass.Int32(0):
                             iket.range_pop()
 
-                        if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_push("sm120_fc1_epi_pack_smem")
-                        cute.arch.barrier(
-                            barrier_id=self.epilog_sync_bar_id,
-                            number_of_threads=32 * len(self.compute_warp_id),
-                        )
-                        if trace_compute_detail != cutlass.Int32(0):
-                            iket.range_pop()
+                    # Packed rows are disjoint across ng_pair iterations.
+                    # Join their stores once before the coalesced SMEM drain.
+                    if trace_compute_detail != cutlass.Int32(0):
+                        iket.range_push("sm120_fc1_epi_pack_smem")
+                    cute.arch.barrier(
+                        barrier_id=self.epilog_sync_bar_id,
+                        number_of_threads=32 * len(self.compute_warp_id),
+                    )
+                    if trace_compute_detail != cutlass.Int32(0):
+                        iket.range_pop()
 
                     chunks_per_row = downproj_per_cta // 8
                     store_iters = (
@@ -5724,18 +6188,24 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                             )
 
         # ════════════════════════════════════════════════════════════════════
-        # Dispatch warps hook (warp 8-11; MegaMoE-only)
+        # Dispatch hook (warp 7 for compact K1, otherwise warps 8-11)
         # ════════════════════════════════════════════════════════════════════
         #
-        # ``has_dispatch_warps=False`` means warps 8-11 don't exist at all
-        # (threads_per_cta = 256), so the hook call is entirely
-        # const_expr-eliminated. When present, the subclass implements the
+        # Compact K2 has no dispatch hook. Compact K1 dispatches from its
+        # otherwise idle auxiliary warp 7; ordinary K1 uses warps 8-11.
+        # When dispatch is present, the subclass implements the
         # full dispatch chain inside this
         # hook (prep -> cross-rank barrier -> per-token pull -> release
         # to fc1 -> arrive on dispatch-to-sched NamedBarrier).
         if cutlass.const_expr(self.has_dispatch_warps):
+            dispatch_trace_start = cutlass.Int64(0)
+            if cutlass.const_expr(green_trace is not None):
+                if warp_idx == cutlass.Int32(self.dispatch_warp_id[0]):
+                    if cute.arch.lane_idx() == cutlass.Int32(0):
+                        dispatch_trace_start = read_globaltimer()
             if warp_idx >= self.dispatch_warp_id[0]:
-                cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
+                if cutlass.const_expr(self.use_warpgroup_reg_realloc):
+                    cute.arch.warpgroup_reg_dealloc(self.task_reg_cnt)
 
                 lane_idx_for_dispatch = cute.arch.lane_idx()
                 if cutlass.const_expr(self.token_back_standalone):
@@ -5750,6 +6220,7 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                             lane_idx=lane_idx_for_dispatch,
                             tidx=tidx,
                         )
+
                     else:
                         self.token_comm_hook_token_back_warp_body(
                             token_comm_args,
@@ -5773,6 +6244,20 @@ class Sm120SwapABSwigluNvfp4Fc12Kernel:
                             warp_idx=warp_idx,
                             lane_idx=lane_idx_for_dispatch,
                             tidx=tidx,
+                        )
+
+            if cutlass.const_expr(green_trace is not None):
+                if warp_idx == cutlass.Int32(self.dispatch_warp_id[0]):
+                    if cute.arch.lane_idx() == cutlass.Int32(0):
+                        cute.arch.store(
+                            green_trace.iterator
+                            + trace_word(
+                                trace_role,
+                                cta_linear_id,
+                                FIELD_DISPATCH_WARP_NS,
+                            ),
+                            read_globaltimer() - dispatch_trace_start,
+                            scope="gpu",
                         )
 
         # ════════════════════════════════════════════════════════════════════

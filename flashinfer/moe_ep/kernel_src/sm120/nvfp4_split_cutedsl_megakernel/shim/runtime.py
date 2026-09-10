@@ -119,6 +119,7 @@ class _ExecutionStorage:
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
     combine_sf: torch.Tensor | None
+    rank_combine_ready: torch.Tensor | None
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     green_trace: torch.Tensor | None = None
 
@@ -131,6 +132,7 @@ class _ExecutionBuffers:
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
     combine_sf: torch.Tensor | None
+    rank_combine_ready: torch.Tensor | None
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     green_trace: torch.Tensor | None = None
 
@@ -196,6 +198,9 @@ class MegaMoESm120Nvfp4Frontend:
 
     _LOCAL_RESET_REGIONS = (
         "l1_arrival_count",
+        "dispatch_rank_cache_state",
+        "rank_combine_route_map",
+        "rank_combine_tile_done",
         "expert_send_count",
         "grid_sync_counter",
         "fc1_done_counter",
@@ -391,8 +396,11 @@ class MegaMoESm120Nvfp4Frontend:
                 f"rank={self.config.rank} "
                 f"capacity={self.config.max_tokens_per_rank} "
                 f"bucket={bucket} K1={kernel.k1_tile} "
+                f"K1_stages={kernel.k1_stages or 'auto'} "
                 f"K2={kernel.k2_tile}/stage{kernel.k2_stages} "
                 f"bundle={kernel.ready_queue_bundle} "
+                f"rank_cache={kernel.dispatch_rank_cache} "
+                f"rank_combine={kernel.rank_local_combine} "
                 f"tail_reclaim={getattr(kernel, 'k2_tail_reclaim', False)} "
                 f"green={kernel.k1_sms}/{kernel.k2_sms}",
                 flush=True,
@@ -448,6 +456,13 @@ class MegaMoESm120Nvfp4Frontend:
                 )
                 self.workspace._sym_roots.append(sf_root)
             self.workspace._sym_roots.append(root)
+            rank_combine_ready = None
+            if spec.kernel.rank_local_combine and self.config.combine_dtype == "bf16":
+                rank_combine_ready = sym_zeros(
+                    (self.compile_bucket, self.config.world_size),
+                    torch.int32,
+                )
+                self.workspace._sym_roots.append(rank_combine_ready)
             epilogue_args = (
                 self.workspace.fc1_alpha,
                 self.workspace.fc2_alpha,
@@ -474,6 +489,7 @@ class MegaMoESm120Nvfp4Frontend:
                 shared_workspace=shared_workspace,
                 combine_output=combine_output,
                 combine_sf=combine_sf,
+                rank_combine_ready=rank_combine_ready,
                 epilogue_args=epilogue_args,
                 green_trace=green_trace,
             )
@@ -485,6 +501,7 @@ class MegaMoESm120Nvfp4Frontend:
             shared_workspace=storage.shared_workspace,
             combine_output=storage.combine_output,
             combine_sf=storage.combine_sf,
+            rank_combine_ready=storage.rank_combine_ready,
             epilogue_args=storage.epilogue_args,
             green_trace=storage.green_trace,
         )
@@ -511,6 +528,7 @@ class MegaMoESm120Nvfp4Frontend:
         shared_workspace = execution.shared_workspace
         combine_output = execution.combine_output
         combine_sf = execution.combine_sf
+        rank_combine_ready = execution.rank_combine_ready
         epilogue_args = execution.epilogue_args
         green_trace = execution.green_trace
 
@@ -530,6 +548,8 @@ class MegaMoESm120Nvfp4Frontend:
             green_trace,
             root_cuda,
         )
+        if spec.kernel.rank_local_combine:
+            base_runtime["combine_ready_flags"] = self._to_cute(rank_combine_ready)
         runtime_k1 = dict(base_runtime, stream=k1_cuda)
         runtime_k2 = dict(base_runtime, stream=k2_cuda)
         compile_k1 = dict(runtime_k1, max_active_clusters=spec.kernel.k1_sms)
@@ -576,40 +596,93 @@ class MegaMoESm120Nvfp4Frontend:
                 k2_finalizer,
                 **dict(runtime_finalizer, max_active_clusters=1),
             )
+        finalizer_executor = compiled_finalizer.to(None) if compiled_finalizer else None
 
         combine_bucket = combine_output[: self.compile_bucket]
         combine_sf_bucket = (
             combine_sf[: self.compile_bucket] if combine_sf is not None else None
         )
         output_bucket = inputs.output[: self.compile_bucket]
-        k3_plan = compile_combine_reduce(
-            combine_bucket,
-            output_bucket,
-            None,
-            combine_sf=combine_sf_bucket,
-            combine_format=self.config.combine_format,
-            stream=root_cuda,
-        )
-        (
-            compiled_k3,
-            combine_cute,
-            combine_sf_cute,
-            output_cute,
-            score_cute,
-            k3_stream,
-        ) = k3_plan
-        runtime_k3 = dict(
-            combine_cute=combine_cute,
-            combine_sf_cute=combine_sf_cute,
-            reduced_cute=output_cute,
-            topk_score_cute=score_cute,
-            stream=k3_stream,
-        )
+        if spec.kernel.rank_local_combine:
+            from moe_sm120_nvfp4_split.kernel_rank_local_combine import (
+                compile_rank_local_combine,
+            )
+
+            if rank_combine_ready is None:
+                raise RuntimeError("rank-local combine ready storage is missing")
+            region_kernel = bundle.k1
+            route_spec = region_kernel._local_region_by_name[
+                "rank_combine_route_output"
+            ]
+            route_offset = region_kernel._local_offsets["rank_combine_route_output"]
+            route_output = (
+                local_workspace[route_offset : route_offset + route_spec.nbytes]
+                .view(torch.bfloat16)
+                .reshape(route_spec.shape)
+            )
+            map_spec = region_kernel._local_region_by_name["rank_combine_route_map"]
+            map_offset = region_kernel._local_offsets["rank_combine_route_map"]
+            route_map = (
+                local_workspace[map_offset : map_offset + map_spec.nbytes]
+                .view(torch.int32)
+                .reshape(map_spec.shape)
+            )
+            (
+                compiled_rank_aggregate,
+                runtime_rank_aggregate,
+                compiled_k3,
+                runtime_k3,
+            ) = compile_rank_local_combine(
+                route_output,
+                route_map,
+                combine_bucket,
+                rank_combine_ready[: self.compile_bucket],
+                output_bucket,
+                base_runtime["peer_rank_ptr_mapper_host"],
+                world_size=self.config.world_size,
+                local_rank=self.config.rank,
+                stream=root_cuda,
+                topk_ids=inputs.topk_ids[: self.compile_bucket],
+                num_experts_per_rank=self.config.num_total_experts
+                // self.config.world_size,
+            )
+            if finalizer_executor is not None:
+                raise RuntimeError(
+                    "rank-local combine cannot share the K2 finalizer slot"
+                )
+            compiled_finalizer = compiled_rank_aggregate
+            finalizer_executor = (
+                compiled_rank_aggregate.to(None) if compiled_rank_aggregate else None
+            )
+            runtime_finalizer = runtime_rank_aggregate
+        else:
+            k3_plan = compile_combine_reduce(
+                combine_bucket,
+                output_bucket,
+                None,
+                combine_sf=combine_sf_bucket,
+                combine_format=self.config.combine_format,
+                stream=root_cuda,
+            )
+            (
+                compiled_k3,
+                combine_cute,
+                combine_sf_cute,
+                output_cute,
+                score_cute,
+                k3_stream,
+            ) = k3_plan
+            runtime_k3 = dict(
+                combine_cute=combine_cute,
+                combine_sf_cute=combine_sf_cute,
+                reduced_cute=output_cute,
+                topk_score_cute=score_cute,
+                stream=k3_stream,
+            )
 
         k1_executor = compiled_k1.to(None)
         k2_executor = compiled_k2.to(None)
         drain_executor = compiled_drain.to(None) if compiled_drain else None
-        finalizer_executor = compiled_finalizer.to(None) if compiled_finalizer else None
         k3_executor = compiled_k3.to(None)
         all_kernels_ready = time.monotonic()
         graph = NativeGreenContextGraph.capture(
@@ -676,17 +749,34 @@ class MegaMoESm120Nvfp4Frontend:
                 continue
             offset = int(kernel._local_offsets[name])
             size = int(kernel._local_region_by_name[name].nbytes)
-            execution.local_workspace[offset : offset + size].zero_()
+            region = execution.local_workspace[offset : offset + size]
+            if name == "rank_combine_route_map":
+                region.view(torch.int32).fill_(-1)
+            else:
+                region.zero_()
         if "expert_recv_count_sum" in kernel._shared_offsets:
             offset = int(kernel._shared_offsets["expert_recv_count_sum"])
             size = int(kernel._shared_region_by_name["expert_recv_count_sum"].nbytes)
             execution.shared_workspace[offset : offset + size].zero_()
         if execution.green_trace is not None:
             execution.green_trace.zero_()
+        if execution.rank_combine_ready is not None:
+            execution.rank_combine_ready.zero_()
 
     def run(self, inputs: MegaMoESm120Nvfp4Inputs) -> torch.Tensor:
         compiled = self._ensure_compiled(inputs)
         compiled.graph.launch(torch.cuda.current_stream())
+        # Diagnostic-only escape hatch.  The normal graph path remains fully
+        # asynchronous; profiling can request the per-CTA globaltimer buffer
+        # after a completed launch without perturbing the captured graph.
+        trace_dump_dir = os.environ.get("MEGA_SPLIT_TRACE_DUMP_DIR")
+        if trace_dump_dir and compiled.execution.green_trace is not None:
+            os.makedirs(trace_dump_dir, exist_ok=True)
+            torch.cuda.current_stream().synchronize()
+            torch.save(
+                compiled.execution.green_trace.cpu(),
+                os.path.join(trace_dump_dir, f"rank{self.config.rank}.pt"),
+            )
         return inputs.output
 
     def release(self) -> None:

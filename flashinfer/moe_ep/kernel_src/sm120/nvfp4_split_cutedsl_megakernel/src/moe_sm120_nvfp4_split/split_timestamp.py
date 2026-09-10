@@ -5,7 +5,7 @@ from cutlass.cutlass_dsl import Int64, T, dsl_user_op
 
 
 TRACE_CTA_CAPACITY = 256
-TRACE_FIELDS = 17
+TRACE_FIELDS = 22
 TRACE_ROLES = 2
 TRACE_TMA_WAIT_SAMPLE_STRIDE = 8
 
@@ -36,6 +36,15 @@ FIELD_MAINLOOP_NS = 13
 FIELD_STORE_NS = 14
 FIELD_TMA_A_TIMED_CALLS = 15
 FIELD_TMA_B_TIMED_CALLS = 16
+# Aggregate FP4 encode sub-stages, measured by compute warp 0/lane 0.  These
+# fields are populated only by the diagnostic K2-tile trace build.
+FIELD_NVFP4_ROUND_LOCAL_AMAX_NS = 17
+FIELD_NVFP4_AMAX_SHUFFLE_NS = 18
+FIELD_NVFP4_SCALE_RECIP_NS = 19
+FIELD_NVFP4_QUANT_PACK_NS = 20
+# Time spent by the lead K1 dispatch warp in the cross-rank dispatch body.
+# This is a diagnostic work measure; dispatch overlaps FC1 compute.
+FIELD_DISPATCH_WARP_NS = 21
 
 K2_TILE_FIELD_TILE_ID = 0
 K2_TILE_FIELD_DEQUEUE_BEGIN = 1

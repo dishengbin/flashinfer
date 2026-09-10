@@ -23,7 +23,7 @@ from .jit_config import Sm120JitConfig
 
 
 # Bump when a generated-kernel ABI or opaque workspace layout changes.
-KERNEL_CACHE_ABI = 4
+KERNEL_CACHE_ABI = 8
 
 
 @dataclass(frozen=True)
@@ -119,6 +119,20 @@ class MegaMoECompileSpec:
     def __post_init__(self) -> None:
         self.problem.validate()
         self.build.validate()
+        if self.kernel.rank_local_combine and self.build.combine_format != "bf16":
+            raise ValueError("rank_local_combine requires BF16 combine")
+        if (
+            self.kernel.k1_stages is not None
+            and self.kernel.k1_stages > 2
+            and self.problem.expert_parallel_size > 1
+            and not self.kernel.rank_local_combine
+        ):
+            # The route-level peer publication path did not pass replay
+            # consistency with a deeper K1 pipeline. Rank-local publication
+            # uses an explicit completion/acquire protocol and is validated.
+            raise ValueError(
+                "k1_stages > 2 requires rank_local_combine for multi-rank execution"
+            )
         if self.kernel.total_sms <= 0:
             raise ValueError("kernel SM partition must be non-empty")
 
@@ -263,6 +277,10 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         dispatch_warps=config.dispatch_warps,
         dispatch_warps_per_tile=config.dispatch_warps_per_tile,
         dispatch_compute_overlap=config.dispatch_compute_overlap,
+        dispatch_rank_cache=config.dispatch_rank_cache,
+        rank_local_combine=(
+            config.rank_local_combine and not combine_format.is_quantized
+        ),
         k1_ready_queue_workspace=config.k1_ready_queue,
         k2_ready_queue=config.k2_ready_queue,
         k2_ready_queue_bundle=config.ready_queue_bundle,
@@ -275,6 +293,7 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     k1 = build_sm120_dispatch_fc1_kernel(
         group_hint=k1_group_hint,
         mma_tiler_mnk=config.k1_tile,
+        num_ab_stages_override=config.k1_stages,
         load_balance_mode="static",
         green_trace_role=0,
         **common_kwargs,

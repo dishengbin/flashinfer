@@ -51,6 +51,13 @@ _HYBRID_SM_PARTITION = (48, 16, 16, 30)
 # N32 preset together with all larger prefill bands.
 _LOCAL_DECODE_MAX_ROWS_PER_EXPERT = 6.0
 
+# Nsight Systems traces on the same-NUMA EP4 MegaMoE prefill shape below show
+# K2 alternating between FC2 work and peer-output publication.  Publishing
+# four hidden tiles per ready-queue entry, instead of the generic large-wave
+# bundle of 16, lets the K2 workers interleave those phases more evenly.  Keep
+# this tuning inside the measured model/topology envelope.
+_EP4_MEGAMOE_PREFILL_READY_QUEUE_BUNDLE = 4
+
 
 def _scale_sm_partition(
     *,
@@ -72,13 +79,8 @@ def _scale_sm_partition(
             f"of at least {min_partition} SMs"
         )
 
-    aligned_minimum = (
-        (min_partition + alignment - 1) // alignment * alignment
-    )
-    targets = tuple(
-        num_sms * count / _REFERENCE_SM_COUNT
-        for count in reference_counts
-    )
+    aligned_minimum = (min_partition + alignment - 1) // alignment * alignment
+    targets = tuple(num_sms * count / _REFERENCE_SM_COUNT for count in reference_counts)
     counts = []
     for target in targets[:-1]:
         units = int(target / alignment + 0.5)
@@ -107,6 +109,7 @@ def _scale_sm_partition(
         remainder += alignment
 
     return (*counts, remainder)
+
 
 @dataclass(frozen=True)
 class MegaMoEHeuristicInput:
@@ -171,8 +174,7 @@ class MegaMoEHeuristicInput:
         if self.ep_same_numa_peer_count < 0 or self.ep_cross_numa_peer_count < 0:
             raise ValueError("EP peer counts must be non-negative")
         if (
-            self.ep_same_numa_peer_count
-            + self.ep_cross_numa_peer_count
+            self.ep_same_numa_peer_count + self.ep_cross_numa_peer_count
             != self.expert_parallel_size - 1
         ):
             raise ValueError(
@@ -188,12 +190,13 @@ class MegaMoEHeuristicInput:
 
 @dataclass(frozen=True)
 class MegaMoEHeuristicOverrides:
-    """Benchmark-only explicit overrides; ``None`` means use the heuristic."""
+    """Explicit tuning overrides; ``None`` means use the heuristic."""
 
     comm_backend: Optional[str] = None
     token_back_mode: Optional[str] = None
     k1_tile: Optional[Tile] = None
     k2_tile: Optional[Tile] = None
+    k1_stages: Optional[int] = None
     k2_stages: Optional[int] = None
     k2_warps: Optional[int] = None
     k1_sms: Optional[int] = None
@@ -215,6 +218,8 @@ class MegaMoEHeuristicOverrides:
     tp_k3_chunks: Optional[int] = None
     dispatch_warps: Optional[int] = None
     dispatch_compute_overlap: Optional[bool] = None
+    dispatch_rank_cache: Optional[bool] = None
+    rank_local_combine: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +232,7 @@ class MegaMoEKernelConfig:
 
     k1_tile: Tile
     k2_tile: Tile
+    k1_stages: Optional[int]
     k2_stages: int
     k2_warps: int
 
@@ -254,6 +260,8 @@ class MegaMoEKernelConfig:
     dispatch_warps: int
     dispatch_warps_per_tile: int
     dispatch_compute_overlap: bool
+    dispatch_rank_cache: bool
+    rank_local_combine: bool
     k1_ready_queue: bool
     k1_ready_queue_m_rotation: int
     k2_ready_queue: bool
@@ -271,19 +279,17 @@ class MegaMoEKernelConfig:
         self, overrides: MegaMoEHeuristicOverrides
     ) -> "MegaMoEKernelConfig":
         updates = {
-            name: value
-            for name, value in vars(overrides).items()
-            if value is not None
+            name: value for name, value in vars(overrides).items() if value is not None
         }
         if not updates:
             return self
-        if (
-            overrides.dispatch_warps is not None
-            and overrides.dispatch_warps not in (1, 2, 4)
+        if overrides.dispatch_warps is not None and overrides.dispatch_warps not in (
+            1,
+            2,
+            4,
         ):
             raise ValueError(
-                "dispatch_warps must be one of 1/2/4, got "
-                f"{overrides.dispatch_warps}"
+                f"dispatch_warps must be one of 1/2/4, got {overrides.dispatch_warps}"
             )
         sm_names = ("k1_sms", "k2_sms", "tx_sms", "rx_sms")
         provided_sms = [name for name in sm_names if name in updates]
@@ -409,10 +415,7 @@ def select_megamoe_config(
         k1_token_n = 128
 
     cross_numa = shape.ep_cross_numa_peer_count > 0
-    local_decode = (
-        not cross_numa
-        and rows <= _LOCAL_DECODE_MAX_ROWS_PER_EXPERT
-    )
+    local_decode = not cross_numa and rows <= _LOCAL_DECODE_MAX_ROWS_PER_EXPERT
     k2_token_n = 16 if local_decode else k1_token_n
     k1_tile = (64, k1_token_n, 128)
     k2_tile = (64, k2_token_n, 128)
@@ -458,9 +461,7 @@ def select_megamoe_config(
     # first handoff even when a 64-row payload fits the byte limit; above that
     # band the extra operations outweigh the earlier first tile.
     dispatch_bytes_per_token = (
-        (shape.hidden + 1) // 2
-        + (shape.hidden + 15) // 16
-        + shape.num_topk * 4
+        (shape.hidden + 1) // 2 + (shape.hidden + 15) // 16 + shape.num_topk * 4
     )
     dispatch_chunk_tokens = (
         32
@@ -470,8 +471,7 @@ def select_megamoe_config(
                 512 <= shape.tokens_per_rank <= 1024
                 or (
                     shape.tokens_per_rank >= 128
-                    and dispatch_bytes_per_token * 64
-                    > _DISPATCH_MAX_IBGDA_CHUNK_BYTES
+                    and dispatch_bytes_per_token * 64 > _DISPATCH_MAX_IBGDA_CHUNK_BYTES
                 )
             )
         )
@@ -487,11 +487,7 @@ def select_megamoe_config(
     # the complete small-message window; terminal ACKs still retire the epoch
     # before the next replay can reuse it.  Larger shapes stay on the measured
     # two-slot fast path so their streaming reuse distance is unchanged.
-    combine_slots = (
-        4
-        if cross_numa and shape.tokens_per_rank <= 128
-        else 2
-    )
+    combine_slots = 4 if cross_numa and shape.tokens_per_rank <= 128 else 2
     combine_chunk_rows = 16
     combine_blocking_put = (
         cross_numa
@@ -501,21 +497,39 @@ def select_megamoe_config(
         <= _COMBINE_BLOCKING_PUT_MAX_CHUNK_BYTES
     )
     remote_handoff_windows = 2 if cross_numa else 1
+    ep4_megamoe_prefill = (
+        not cross_numa
+        and shape.expert_parallel_size == 4
+        and shape.hidden == 6144
+        # The problem spec stores the complete gated W13 row count.
+        and shape.intermediate == 2 * 2304
+        and shape.num_topk == 8
+        and shape.num_total_experts == 128
+        and rows > 512.0
+    )
+    # Keep the K2 last-contributor experiment opt-in until performance is
+    # validated across shapes. The earlier standalone aggregator regressed
+    # EP4 even though it reduced PCIe payload.
+    ep_pcie_rank_local_combine = False
+    if local_decode:
+        ready_queue_bundle = 2
+    elif ep4_megamoe_prefill:
+        ready_queue_bundle = _EP4_MEGAMOE_PREFILL_READY_QUEUE_BUNDLE
+    elif rows <= 128.0:
+        ready_queue_bundle = 4
+    elif rows <= 512.0:
+        ready_queue_bundle = 8
+    else:
+        ready_queue_bundle = 16
 
     # Keep the four-warp physical group for setmaxnreg and kernel-tail
     # rendezvous, but activate only one warp for small same-NUMA dispatches.
     # Each routed row carries one packed NVFP4 activation, its per-16 scale,
     # and one FP32 top-k weight.  Cross-NUMA transport continues to use all
     # four warps because those warps are also reused by the combine sender.
-    dispatch_row_bytes = (
-        (shape.hidden + 1) // 2
-        + (shape.hidden + 15) // 16
-        + 4
-    )
+    dispatch_row_bytes = (shape.hidden + 1) // 2 + (shape.hidden + 15) // 16 + 4
     expected_remote_dispatch_rows = (
-        shape.tokens_per_rank
-        * shape.num_topk
-        * shape.ep_same_numa_peer_count
+        shape.tokens_per_rank * shape.num_topk * shape.ep_same_numa_peer_count
     )
     remote_dispatch_bytes_per_k1_cta = (
         expected_remote_dispatch_rows * dispatch_row_bytes / k1_sms
@@ -541,16 +555,13 @@ def select_megamoe_config(
     config = MegaMoEKernelConfig(
         comm_backend=comm_backend,
         kernel_comm_backend=kernel_comm_backend,
-        token_back_mode=(
-            "reuse_dispatch_warps" if cross_numa else "epi_warps"
-        ),
+        token_back_mode=("reuse_dispatch_warps" if cross_numa else "epi_warps"),
         k1_tile=k1_tile,
         k2_tile=k2_tile,
+        # None preserves the kernel's SMEM-aware automatic stage selection.
+        k1_stages=None,
         k2_stages=(
-            3
-            if k2_token_n == 64
-            or (k2_token_n == 128 and rows <= 512.0)
-            else 2
+            3 if k2_token_n == 64 or (k2_token_n == 128 and rows <= 512.0) else 2
         ),
         k2_warps=8,
         k1_sms=k1_sms,
@@ -574,32 +585,65 @@ def select_megamoe_config(
         ibgda_rc_mapping="warp",
         tp_k3_chunks=(
             8
-            if shape.tensor_parallel_size == 2
-            and shape.tokens_per_rank >= 8192
+            if shape.tensor_parallel_size == 2 and shape.tokens_per_rank >= 8192
             else 1
         ),
         dispatch_pull_mode="token_strided",
         dispatch_warps=dispatch_warps,
         dispatch_warps_per_tile=8,
         dispatch_compute_overlap=shape.tokens_per_rank >= 1024,
+        # One token may select several experts on the same destination rank.
+        # Cache the first received activation locally so later routes can
+        # avoid another peer transfer.  This is enabled only for the measured
+        # EP4 MegaMoE prefill envelope for now.
+        dispatch_rank_cache=ep4_megamoe_prefill,
+        # PCIe/BAR1 writes are substantially more expensive than local HBM
+        # traffic.  Stage per-route FC2 rows locally, reduce all routes for a
+        # (source rank, source token) on this expert rank, and publish one row.
+        # The BF16-only implementation is selected by api.py.
+        rank_local_combine=ep_pcie_rank_local_combine,
         k1_ready_queue=True,
         # Keep the production selector independent of DP layout.  The old
         # DP-only queue rotation was an experiment, not a portable heuristic.
         k1_ready_queue_m_rotation=0,
         k2_ready_queue=True,
-        # Very short expert waves need finer-grained K2 distribution; larger
-        # waves amortize queue traffic with wider hidden-tile bundles.
-        ready_queue_bundle=(
-            2
-            if local_decode
-            else 4 if rows <= 128.0 else 8 if rows <= 512.0 else 16
-        ),
+        # Short expert waves and the tuned EP4 prefill shape benefit from
+        # finer-grained K2 distribution.  Generic large waves retain wider
+        # hidden-tile bundles to amortize queue traffic.
+        ready_queue_bundle=ready_queue_bundle,
         k2_natural_regs=(k2_token_n == 32),
         k2_min_blocks_per_sm=2 if k2_token_n == 32 else 1,
         expected_rows_per_expert=rows,
     )
     if overrides is not None:
         config = config.with_overrides(overrides)
+    if (
+        ep4_megamoe_prefill
+        and 2560 <= shape.tokens_per_rank <= 11895
+        and shape.data_parallel_size == shape.tensor_parallel_size == 1
+        and shape.num_sms == _REFERENCE_SM_COUNT
+        and config.comm_backend == "p2p_direct"
+        and config.rank_local_combine
+        and config.dispatch_rank_cache
+        and config.k1_tile == config.k2_tile == (64, 128, 128)
+        and (config.k1_sms, config.k2_sms) == _LOCAL_DEFAULT_SM_PARTITION
+        and config.k2_warps == 8
+    ):
+        # Native EP4 measurements favor five K1 AB stages with one active
+        # dispatch warp and four K2 stages. Compact K1 overlaps register
+        # loads across K128 steps. Both kernels retain one CTA/SM;
+        # the deeper pipelines overlap more loads with MMA while bundle 12
+        # amortizes rank-local publication. Keep this preset within the
+        # measured geometry/device range and preserve explicit overrides.
+        preset = dict(k1_stages=5, k2_stages=4, dispatch_warps=1, ready_queue_bundle=12)
+        config = replace(
+            config,
+            **{
+                name: value
+                for name, value in preset.items()
+                if overrides is None or getattr(overrides, name) is None
+            },
+        )
     if config.total_sms != shape.num_sms:
         raise ValueError(
             "resolved SM partitions must cover all device SMs: "
@@ -609,6 +653,8 @@ def select_megamoe_config(
         )
     if config.tp_k3_chunks <= 0:
         raise ValueError("tp_k3_chunks must be positive")
+    if config.k1_stages is not None and config.k1_stages <= 0:
+        raise ValueError("k1_stages must be positive")
     if config.dispatch_warps not in (1, 2, 4):
         raise ValueError("dispatch_warps must be one of 1/2/4")
     if config.comm_backend != "p2p_direct" and config.dispatch_warps != 4:

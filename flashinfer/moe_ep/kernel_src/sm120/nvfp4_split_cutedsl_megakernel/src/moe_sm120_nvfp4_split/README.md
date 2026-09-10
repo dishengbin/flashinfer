@@ -21,6 +21,130 @@ whole expert pool. Same-NUMA EP uses direct P2P activation pull and direct
 peer-store combine. Cross-NUMA EP keeps local peers on P2P and sends only
 cross-NUMA traffic through staged NVSHMEM IBGDA transport.
 
+K1's epilogue processes a complete token tile in two passes. The first keeps
+SwiGLU values in consumed accumulator registers and stores each token's four
+warp-local maxima in a dense shared layout. The second combines warp-pair
+maxima, quantizes, and packs disjoint token rows. Two whole-tile barriers
+replace the two barriers per 16-token group; the existing 512-float scratch
+allocation accommodates every supported token tile (16/32/64/128). Numerical
+operation order and the workspace ABI are unchanged.
+
+The FlashInfer frontend has an experimental BF16 `rank_local_combine` knob,
+disabled by default. With this knob, dispatch publishes each source token's
+contributor count to its expert ranks and records the local route rows. K2
+stores BF16 route results locally. For aligned hidden dimensions of at least
+2048, it partitions each row into four segments (1536 elements each at
+H=6144). Smaller or unaligned rows use one segment. A GPU completion counter
+joins the hidden tiles within each segment; only its last hidden tile updates
+the segment's per-token contributor counters. Each lane joins one token's
+contributor counter, then a warp ballot selects the last contributors for
+reduction. Each warp assigns two winners to separate 16-lane groups, with an
+inactive second group for an odd final pair. A warp barrier transfers each
+winner's GPU acquire before the cooperative route loads. Local BF16 route
+stores omit the peer-store shuffle packing by default; an explicit JIT store
+override remains available.
+The last contributor reduces the local routes in FP32, rounds the segment
+to BF16, and posts it to the source rank. Each lane reduces 16 adjacent BF16
+values, and the final
+256-element iteration is masked at the segment boundary. This also handles
+640-element segments at H=2560 without overlapping the neighboring segment.
+This spreads row reduction across K2 tasks and shortens the publication tail.
+Route loads are issued in pairs while retaining the original slot
+accumulation order; cached word offsets use Int32 when the
+complete address range fits, otherwise Int64.
+For route pools whose element count reaches the signed 32-bit indexing
+limit, K2 widens the local BF16 output row coordinate to Int64 before the
+layout multiplies it by the hidden stride. Widening only the resulting
+pointer would be too late. This prevents address wraparound when the live
+routed rows exceed roughly 349,525 at H=6144, as observed in the larger
+EP2/EP4 prefill cases. Smaller pools retain their existing indexing path.
+
+K3 (`kernel_rank_local_combine.py`) reduces the live rank partials with
+consecutive scalar BF16 accesses across lanes. This adds one BF16 rounding
+compared with the ordinary route-level combine.
+
+All completion counters reside on the local GPU. CTA/warp barriers and
+GPU acquire-release counters carry the route writes to each segment's
+publisher. After peer stores, a system acquire-release RMW chain on a local
+counter joins the completed segments. Its last participant publishes the
+ready word with a system-release store; K3 acquires that word before reading
+the full rank partial. This does not require PCIe peer atomics. See the PTX
+[memory consistency model](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#memory-consistency-model).
+There is no standalone aggregation kernel in this graph and no polling in
+the K2 epilogue. The standalone route-map aggregator is retained as a
+diagnostic reference. Extra workspace holds the BF16 route rows, route map,
+and counters. Segment counters add `4 * world_size * max_tokens_per_rank`
+Int32 words over the single-segment layout (386,880 bytes at EP4/T=6045);
+cache ABI 8 separates this workspace layout from older compiled kernels.
+The opt-in path requires direct P2P, token-strided dispatch,
+epi-warp BF16 combine, and `world_size <= top_k`.
+
+For the measured 110-SM, same-NUMA EP4 prefill geometry (H=6144,
+post-SwiGLU intermediate=2304, 128 experts, top-k=8, DP=TP=1,
+2560–11895 tokens/rank), enabling `rank_local_combine` also selects a deeper
+native pipeline: K1 stage=5, K2 stage=4, one active dispatch warp, and
+ready-queue bundle=12. This preset requires rank caching, (64,128,128) K1/K2
+tiles, eight K2 warps, and the 72/38 SM partition. Explicit tuning overrides
+take precedence. Other shapes retain their existing selection.
+
+At 6045 tokens/rank (M/rank=48360), three alternating CUDA-event measurements
+with 10 warmups and 100 iterations per run gave a median critical-rank graph
+latency of 9.893 ms, versus 11.980 ms for the previous tuned configuration
+(17.42% lower latency, 21.09% higher throughput). The graph includes reset,
+concurrent K1/K2, and K3; input staging and JIT compilation are excluded.
+A subsequent K2 reduction change processes two tokens per warp with wider
+per-lane vectors. Three interleaved before/after CUDA-event runs (20 warmups,
+200 iterations each) reduced median critical-rank graph latency from 9.896 ms
+to 9.652 ms: 2.46% lower latency and 2.52% higher throughput, reaching
+2.505 million global tokens/s and 425.54 effective GEMM TFLOP/s per rank.
+The pipeline stages and other tuning knobs were held fixed. Across
+M/rank=20480, 48360, and 95160, all 503,808,000 BF16 output elements on four
+ranks were bitwise identical to the preceding rank-local implementation.
+
+The current K1 implementation reuses the otherwise idle FC1 auxiliary warp
+for the single dispatcher, reducing its CTA from twelve to eight warps.
+This applies to direct-P2P rank-local combine with `dispatch_warps=1` and
+the (64,128,128) K1 tile. The four compute warps keep the same MMA order,
+but preload the next K128 tile's first K64 fragment before finishing the
+current tile's second MMA. A warp barrier precedes shared-stage release;
+the final tile is peeled to avoid a reload branch in every iteration.
+The compact CTA uses static register allocation for its mixed-role warp
+group. In the measured toolchain, K1 uses 216 registers/thread and no
+stack frame; the original twelve-warp prefetch prototype spilled and was
+rejected. Both production kernels still run one CTA per SM.
+
+With K1/K2 stages 5/4, a controlled native comparison against the previous
+5/3 implementation at 6045 tokens/rank reduced EP2 latency from 9.773 to
+9.430 ms (3.50%) and EP4 from 9.672 to 9.361 ms (3.22%). Measurements use
+20 warmups and 200 iterations; three preceding alternating EP4 prototype
+pairs also exceeded 3% by their median P50. Across 2560, 6045, 40950, and
+81450 tokens/rank, the final EP2/EP4 comparison improved latency by
+2.39–3.74%; large EP4 cases improved about 2.6%. These are complete compute
+graph measurements under the devices' existing 350 W power limits, not
+clock-normalized or model end-to-end gains. All 24 final rank outputs
+(4,829,368,320 BF16 elements) were bitwise equal to the preceding source.
+Globaltimer builds execute the same new register pipeline and retain
+sampled TMA wait counters; diagnostic timings are excluded from gains.
+EP2 and shapes outside the existing EP4 preset require explicit 5/4 knobs
+to reproduce this configuration; the preset's scope is unchanged.
+
+No globaltimer or profiler instrumentation is needed:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+torchrun --standalone --nproc-per-node=4 \
+  benchmarks/bench_moe_ep_sm120_nvfp4_mega.py \
+  --grouped-gemm-m-values 48360 --combine-dtype bf16 --target graph \
+  --knobs-json '{"rank_local_combine": true}' --warmup 20 --iters 200
+```
+
+The `k1_stages` knob independently overrides the K1 AB pipeline depth and is
+included in the compile cache key. `None` uses the heuristic/kernel default;
+the kernel checks the requested depth against its shared-memory capacity.
+Explicit K1 depths above two require `rank_local_combine` for multi-rank
+execution: the ordinary route-level combine path failed replay consistency
+with the deeper pipeline and is excluded from this optimization.
+
 ## Data contract
 
 - Activation and FC1/FC2 weights: packed `torch.float4_e2m1fn_x2` (two logical
