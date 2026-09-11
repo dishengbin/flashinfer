@@ -446,7 +446,8 @@ def test_sm120_nvfp4_combine_reduce_matches_decode_reference() -> None:
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_sm120
-def test_sm120_nvfp4_four_rank_imbalanced_second_epoch() -> None:
+@pytest.mark.parametrize("ready_queue_bundle", [3, 4, 12])
+def test_sm120_nvfp4_four_rank_imbalanced_second_epoch(ready_queue_bundle) -> None:
     import torch.distributed as dist
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -468,6 +469,7 @@ def test_sm120_nvfp4_four_rank_imbalanced_second_epoch() -> None:
             world_size,
             problem,
             combine_dtype=combine_dtype,
+            knobs={"ready_queue_bundle": ready_queue_bundle},
         )
         try:
             outputs = []
@@ -489,3 +491,107 @@ def test_sm120_nvfp4_four_rank_imbalanced_second_epoch() -> None:
     nvfp4 = combine_outputs["nvfp4"].float()
     rel_l2 = torch.linalg.vector_norm(nvfp4 - bf16) / torch.linalg.vector_norm(bf16)
     assert rel_l2.item() < 0.15
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_sm120
+@pytest.mark.parametrize(
+    "k2_register_prefetch,k2_fused_quant_pack,intermediate",
+    [
+        (False, False, 1024),
+        (True, False, 128),
+        (True, False, 256),
+        (True, False, 1024),
+        (True, True, 128),
+        (True, True, 256),
+        (True, True, 1024),
+    ],
+)
+def test_sm120_nvfp4_compact_k1_changed_epoch(
+    k2_register_prefetch, k2_fused_quant_pack, intermediate
+) -> None:
+    """Compact K1 and optional K2 prefetch preserve bits across changed epochs."""
+    import torch.distributed as dist
+    from flashinfer.moe_ep import MoEEpTensors
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size != 4:
+        pytest.skip("requires exactly four ranks")
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    counts = (17, 16, 7, 1)
+    problem = _problem(
+        rank, world_size, tokens=counts[rank], capacity=32, intermediate=intermediate
+    )
+    base = problem["inputs"]
+    expected = []
+    for stages in (2, 5):
+        extra_knobs = {}
+        if k2_register_prefetch:
+            # N128 exercises the pipelined K2 path. I128/I256 cover the
+            # peeled final tile and the first transition to another stage.
+            extra_knobs["k2_tile"] = (64, 128, 128)
+            if stages == 5:
+                sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+                k1_sms = 2 * (3 * sm_count // 10)
+                extra_knobs.update(
+                    k2_register_prefetch=True,
+                    k2_fused_quant_pack=k2_fused_quant_pack,
+                    k1_sms=k1_sms,
+                    k2_sms=sm_count - k1_sms,
+                    tx_sms=0,
+                    rx_sms=0,
+                )
+        layer = _make_layer(
+            rank,
+            world_size,
+            problem,
+            combine_dtype="nvfp4",
+            knobs=dict(
+                k1_tile=(64, 128, 128),
+                dispatch_warps=1,
+                dispatch_rank_cache=True,
+                k1_stages=stages,
+                k2_stages=3,
+            )
+            | extra_knobs,
+        )
+        try:
+            for epoch in range(3):
+                inputs = MoEEpTensors(
+                    hidden_states=(
+                        base.hidden_states * (1.0 + epoch * 0.125)
+                    ).contiguous(),
+                    topk_ids=(
+                        (base.topk_ids + epoch * 3) % problem["experts"]
+                    ).contiguous(),
+                    topk_weights=base.topk_weights,
+                )
+                layer.stage_inputs(inputs, compile_tokens_per_rank=max(counts))
+                first = layer.compute_staged(output=None).clone()
+                torch.cuda.synchronize()
+                dist.barrier()
+                for _ in range(20):
+                    actual = layer.compute_staged(output=None)
+                    torch.cuda.synchronize()
+                    dist.barrier()
+                    torch.testing.assert_close(
+                        actual.view(torch.int16),
+                        first.view(torch.int16),
+                        atol=0,
+                        rtol=0,
+                    )
+                assert torch.isfinite(first).all()
+                if stages == 2:
+                    expected.append(first)
+                else:
+                    torch.testing.assert_close(
+                        first.view(torch.int16),
+                        expected[epoch].view(torch.int16),
+                        atol=0,
+                        rtol=0,
+                    )
+        finally:
+            layer.destroy()

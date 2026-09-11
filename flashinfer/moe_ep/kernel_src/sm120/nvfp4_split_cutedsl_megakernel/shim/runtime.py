@@ -315,6 +315,7 @@ class MegaMoESm120Nvfp4Frontend:
             sm_partition_alignment=alignment,
             overrides=self._heuristic_overrides(),
             jit=jit,
+            build=SplitKernelBuildOptions(combine_format=cfg.combine_format),
         )
         actual_k1, actual_k2 = query_green_context_sm_counts(
             k1_sm_count=spec.kernel.k1_sms

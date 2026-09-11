@@ -218,6 +218,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         k2_ready_queue: bool = True,
         k2_ready_queue_bundle: int = 16,
         k2_natural_regs: bool = False,
+        k2_register_prefetch: bool = False,
+        k2_fused_quant_pack: bool = False,
         k2_min_blocks_per_sm: int = 1,
         green_trace_role: Optional[int] = None,
         k1_ready_queue_m_rotation: int = 0,
@@ -402,6 +404,8 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
             self.k2_ready_tile_tokens
             // self.fc1_producer_tile_tokens
         )
+        self.k2_register_prefetch = k2_register_prefetch
+        self.k2_fused_quant_pack = k2_fused_quant_pack
         self.compact_k2 = compact_k2
         default_natural_regs = (
             split_role == "k2"
@@ -443,7 +447,10 @@ class Sm120MegaMoENvfp4SwapABKernel(Sm120SwapABSwigluNvfp4Fc12Kernel):
         self.compact_k1 = (
             split_role == "k1"
             and comm_backend == "p2p_direct"
-            and rank_local_combine
+            and (
+                rank_local_combine
+                or (combine_format.is_quantized and num_ab_stages_override == 5)
+            )
             and dispatch_warps == 1
             and tuple(mma_tiler_mnk) == (64, 128, 128)
         )

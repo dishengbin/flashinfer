@@ -199,6 +199,8 @@ class MegaMoEHeuristicOverrides:
     k1_stages: Optional[int] = None
     k2_stages: Optional[int] = None
     k2_warps: Optional[int] = None
+    k2_register_prefetch: Optional[bool] = None
+    k2_fused_quant_pack: Optional[bool] = None
     k1_sms: Optional[int] = None
     k2_sms: Optional[int] = None
     tx_sms: Optional[int] = None
@@ -235,6 +237,8 @@ class MegaMoEKernelConfig:
     k1_stages: Optional[int]
     k2_stages: int
     k2_warps: int
+    k2_register_prefetch: bool
+    k2_fused_quant_pack: bool
 
     k1_sms: int
     k2_sms: int
@@ -564,6 +568,8 @@ def select_megamoe_config(
             3 if k2_token_n == 64 or (k2_token_n == 128 and rows <= 512.0) else 2
         ),
         k2_warps=8,
+        k2_register_prefetch=False,
+        k2_fused_quant_pack=False,
         k1_sms=k1_sms,
         k2_sms=k2_sms,
         tx_sms=tx_sms,

@@ -15,6 +15,30 @@ def _check_cuda(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
     return result[1:]
 
 
+def _split_k1_k2_sm_resources(cuda, sm_resource, k1_sm_count):
+    """Honor an explicit SM count for the split kernels' single-CTA clusters."""
+    # CUDA's default co-scheduled split can round 66 SMs to 72 even when
+    # smCoscheduledAlignment reports 4. Preserve that split when it is exact.
+    # Otherwise use CU_DEV_SM_RESOURCE_SPLIT_IGNORE_SM_COSCHEDULING (0x1),
+    # which older cuda-python bindings do not expose as a named constant.
+    for flags in (0, 0x1):
+        groups, num_groups, remainder = _check_cuda(
+            cuda.cuDevSmResourceSplitByCount(1, sm_resource, flags, k1_sm_count),
+            "cuDevSmResourceSplitByCount",
+        )
+        if int(num_groups) != 1 or len(groups) != 1:
+            raise RuntimeError("CUDA did not produce one K1 SM partition.")
+        counts = (int(groups[0].sm.smCount), int(remainder.sm.smCount))
+        if min(counts) <= 0:
+            raise RuntimeError(f"CUDA produced an empty SM partition: {counts}.")
+        if counts[0] == k1_sm_count:
+            return groups[0], remainder
+    raise RuntimeError(
+        f"CUDA cannot form the requested K1 SM partition: "
+        f"requested={k1_sm_count}, actual={counts[0]}"
+    )
+
+
 def query_sm_resource_info(
     device: Optional[int] = None,
 ) -> tuple[int, int, int]:
@@ -38,7 +62,7 @@ def query_green_context_sm_counts(
     k1_sm_count: int,
     device: Optional[int] = None,
 ) -> tuple[int, int]:
-    """Return the actual CUDA-aligned K1/K2 partition sizes."""
+    """Return exact K1/K2 sizes for the split kernels' single-CTA clusters."""
     from cuda.bindings import driver as cuda
 
     torch.cuda.init()
@@ -56,19 +80,9 @@ def query_green_context_sm_counts(
     total_sms = int(sm_resource.sm.smCount)
     min_partition = max(1, int(sm_resource.sm.minSmPartitionSize))
     if not min_partition <= k1_sm_count <= total_sms - min_partition:
-        raise ValueError(
-            f"invalid K1 SM count {k1_sm_count} for {total_sms} SMs"
-        )
-    groups, num_groups, remainder = _check_cuda(
-        cuda.cuDevSmResourceSplitByCount(1, sm_resource, 0, k1_sm_count),
-        "cuDevSmResourceSplitByCount",
-    )
-    if int(num_groups) != 1 or len(groups) != 1:
-        raise RuntimeError("CUDA did not produce one K1 SM partition.")
-    counts = (int(groups[0].sm.smCount), int(remainder.sm.smCount))
-    if min(counts) <= 0:
-        raise RuntimeError(f"CUDA produced an empty SM partition: {counts}.")
-    return counts
+        raise ValueError(f"invalid K1 SM count {k1_sm_count} for {total_sms} SMs")
+    k1_resource, k2_resource = _split_k1_k2_sm_resources(cuda, sm_resource, k1_sm_count)
+    return int(k1_resource.sm.smCount), int(k2_resource.sm.smCount)
 
 
 @dataclass
@@ -392,16 +406,11 @@ class NativeGreenContextGraph:
                 raise ValueError(
                     f"invalid K1 SM count {k1_sm_count} for {total_sms} SMs"
                 )
-            groups, num_groups, remainder = _check_cuda(
-                cuda.cuDevSmResourceSplitByCount(
-                    1, sm_resource, 0, k1_sm_count
-                ),
-                "cuDevSmResourceSplitByCount",
-            )
-            if int(num_groups) != 1 or len(groups) != 1:
+            try:
+                resources = _split_k1_k2_sm_resources(cuda, sm_resource, k1_sm_count)
+            except Exception:
                 _check_cuda(cuda.cuGraphDestroy(graph), "cuGraphDestroy")
-                raise RuntimeError("CUDA did not produce one K1 SM partition.")
-            resources = (groups[0], remainder)
+                raise
             k1_sm_count = int(resources[0].sm.smCount)
             k2_sm_count = int(resources[1].sm.smCount)
             green_contexts = []

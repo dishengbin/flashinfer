@@ -131,6 +131,21 @@ def test_k1_pipeline_stages_are_independent_and_cacheable() -> None:
                 select_compile_spec(
                     **options, overrides=MegaMoEHeuristicOverrides(k1_stages=5)
                 )
+            from moe_sm120_nvfp4_split.api import SplitKernelBuildOptions
+            fp4_build = SplitKernelBuildOptions(combine_format="16e2m1xbf16")
+            compact = select_compile_spec(
+                **options, build=fp4_build,
+                overrides=MegaMoEHeuristicOverrides(dispatch_warps=1, k1_stages=5),
+            )
+            assert compact.cache_key != automatic.cache_key
+            assert not compact.kernel.rank_local_combine
+            for overrides in (
+                MegaMoEHeuristicOverrides(dispatch_warps=4, k1_stages=5),
+                MegaMoEHeuristicOverrides(dispatch_warps=1, k1_stages=3),
+                MegaMoEHeuristicOverrides(dispatch_warps=1, k1_stages=5, k1_tile=(64,64,128)),
+            ):
+                with pytest.raises(ValueError, match="FP4 compact K1"):
+                    select_compile_spec(**options, build=fp4_build, overrides=overrides)
             tuned = select_compile_spec(
                 **options, overrides=MegaMoEHeuristicOverrides(rank_local_combine=True)
             )
@@ -293,3 +308,73 @@ def test_production_modules_do_not_import_mega_runner() -> None:
                 if any("mega_runner" in name for name in names):
                     offenders.append(str(source.relative_to(package)))
     assert not offenders
+
+
+@pytest.mark.parametrize("option", ["k2_register_prefetch", "k2_fused_quant_pack"])
+def test_k2_optimization_is_explicit_and_cacheable(option: str) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+            import pytest
+            from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import bootstrap_paths
+            bootstrap_paths()
+            from moe_sm120_nvfp4_split.api import MegaMoEProblemSpec, SplitKernelBuildOptions, select_compile_spec
+            from moe_sm120_nvfp4_split.heuristic import MegaMoEHeuristicOverrides
+
+            problem = MegaMoEProblemSpec(tokens_per_rank=6045, num_topk=8, num_total_experts=128, hidden=6144,
+                                        intermediate=4608, expert_parallel_size=4, expert_parallel_rank=0)
+            options = dict(problem=problem, ep_same_numa_peer_count=3, ep_cross_numa_peer_count=0,
+                           num_sms=110, sm_min_partition=4, sm_partition_alignment=4)
+            base = select_compile_spec(**options)
+            assert not base.kernel.k2_register_prefetch
+            fp4 = SplitKernelBuildOptions(combine_format='16e2m1xbf16')
+            kwargs = dict(k1_stages=5, dispatch_warps=1, k2_stages=3, k1_sms=66, k2_sms=44, tx_sms=0, rx_sms=0)
+            off = select_compile_spec(**options, build=fp4, overrides=MegaMoEHeuristicOverrides(**kwargs))
+            on = select_compile_spec(**options, build=fp4, overrides=MegaMoEHeuristicOverrides(**kwargs, k2_register_prefetch=True))
+            assert on.kernel.k2_register_prefetch and on.cache_key != off.cache_key
+            assert (on.kernel.k1_sms,on.kernel.k2_sms)==(66,44)
+            with pytest.raises(ValueError,match='requires EP2/EP4'):
+                select_compile_spec(**options, overrides=MegaMoEHeuristicOverrides(k2_register_prefetch=True))
+            with pytest.raises(ValueError,match='requires EP2/EP4'):
+                select_compile_spec(**options, build=fp4, overrides=MegaMoEHeuristicOverrides(k2_register_prefetch=True,k2_tile=(64,64,128)))
+        """.replace("k2_register_prefetch", option)
+            ),
+        ],
+        check=True,
+    )
+
+
+def test_green_context_honors_requested_sm_partition() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent("""
+            from types import SimpleNamespace
+            import pytest
+            from flashinfer.moe_ep.kernel_src.sm120.nvfp4_split_cutedsl_megakernel import bootstrap_paths
+            bootstrap_paths()
+            from moe_sm120_nvfp4_split.runtime.green_context import _split_k1_k2_sm_resources
+            def resource(n):
+                return SimpleNamespace(sm=SimpleNamespace(smCount=n))
+            calls=[]
+            def split(groups, source, flags, requested):
+                calls.append((groups, flags, requested))
+                n=72 if flags==0 else requested
+                return (0,[resource(n)],1,resource(110-n))
+            fake=SimpleNamespace(cuDevSmResourceSplitByCount=split)
+            a,b=_split_k1_k2_sm_resources(fake,resource(110),72)
+            assert (a.sm.smCount,b.sm.smCount)==(72,38) and calls==[(1,0,72)]
+            calls.clear()
+            a,b=_split_k1_k2_sm_resources(fake,resource(110),66)
+            assert (a.sm.smCount,b.sm.smCount)==(66,44) and calls==[(1,0,66),(1,1,66)]
+            fake.cuDevSmResourceSplitByCount=lambda *args: (0,[],0,resource(110))
+            with pytest.raises(RuntimeError,match='one K1 SM partition'):
+                _split_k1_k2_sm_resources(fake,resource(110),66)
+        """),
+        ],
+        check=True,
+    )

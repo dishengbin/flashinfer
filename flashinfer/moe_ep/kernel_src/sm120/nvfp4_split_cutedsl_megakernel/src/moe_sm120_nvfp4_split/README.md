@@ -141,9 +141,58 @@ torchrun --standalone --nproc-per-node=4 \
 The `k1_stages` knob independently overrides the K1 AB pipeline depth and is
 included in the compile cache key. `None` uses the heuristic/kernel default;
 the kernel checks the requested depth against its shared-memory capacity.
-Explicit K1 depths above two require `rank_local_combine` for multi-rank
-execution: the ordinary route-level combine path failed replay consistency
-with the deeper pipeline and is excluded from this optimization.
+Explicit K1 depths above two require `rank_local_combine`, except for the
+validated EP2/EP4 FP4 compact K1 configuration: direct P2P, one dispatcher,
+K1 tile `(64, 128, 128)`, and `k1_stages=5`. This opt-in path reuses auxiliary
+warp 7 for dispatch and uses the existing compact register-prefetch pipeline.
+Other route-level deep pipelines remain guarded because of earlier replay
+consistency failures.
+
+For FP4 combine, use `dispatch_rank_cache=true, dispatch_warps=1,
+k1_stages=5, k2_stages=3`. On EP4 / H6144 / I2304 / top-k8, two interleaved
+native runs reduce graph P50 from 11.349 to 10.494 ms at 6,045 tokens/rank
+(7.53%), and from 150.892 to 137.664 ms at 81,450 tokens/rank (8.77%).
+Both comparisons include full pre/post output-bit checks. Two imbalanced
+shapes with changing inputs/routes pass three epochs and 20 replays/epoch
+against stage2 output bits. These measurements use concentrated synthetic
+routing; they do not establish arbitrary asynchronous cross-rank replay
+safety or gains on unmeasured shapes. Default stage selection is unchanged.
+
+On the measured 110-SM device, further tuning brings this FP4 path close to
+the tuned BF16 rank-local graph. Enable `k2_register_prefetch=true` and
+`ready_queue_bundle=12`, retaining the stage5/stage3 and dispatch settings
+above. Use `k1_sms=66, k2_sms=44, tx_sms=0, rx_sms=0` for EP4, or
+`k1_sms=68, k2_sms=42, tx_sms=0, rx_sms=0` for EP2. The new prefetch option
+defaults to false and is part of the compile cache key. It supports EP2/EP4
+direct-P2P FP4 combine with K2 tile `(64, 128, 128)`.
+Globaltimer tracing retains the conventional K2 loop; use Nsight Systems
+without `MEGA_SPLIT_GLOBALTIMER` to profile the prefetched path.
+
+K2 retains the current high-K64 operands in registers while loading the next
+low-K64 operands. Shared stages are released after all compute lanes finish
+reading them, and the final K128 tile is peeled to avoid an extra prefetch.
+SM resource queries and graph capture now share an exact-partition helper:
+CUDA's default split is retained when exact; otherwise the helper retries
+with `CU_DEV_SM_RESOURCE_SPLIT_IGNORE_SM_COSCHEDULING`. These kernels use
+single-CTA clusters. This enables explicit 66/44 and 68/42 requests that the
+default CUDA split rounds to 72/38, without changing the default heuristic.
+
+Two interleaved native CUDA-event runs at H6144/I2304/top-k8 give:
+
+| EP | Tokens/rank | Previous stage5 FP4 | Tuned FP4 | Reduction | Concurrently measured BF16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 | 6,045 | 10.504 ms | 9.343 ms | 11.05% | 9.359 ms |
+| 4 | 81,450 | 137.606 ms | 123.366 ms | 10.35% | 123.677 ms |
+| 2 | 6,045 | 10.289 ms | 9.223 ms | 10.35% | 9.517 ms |
+| 2 | 81,450 | 138.925 ms | 123.583 ms | 11.04% | 123.381 ms |
+
+The earlier, faster EP2 large-point BF16 measurement was 120.196 ms; using
+that conservative reference leaves a 2.82% FP4 gap. All native comparisons
+include full pre/post output-bit checks. Changed-input/route checks cover
+EP2/EP4, one- and two-K128 boundaries, and K2 stages 1/3/5 with 20 replays per
+epoch. These results retain the concentrated-routing and 350-W measurement
+limits above. FP4 rounding, scale encoding, accumulation order, and defaults
+are unchanged.
 
 ## Data contract
 
@@ -168,6 +217,31 @@ K2 NVFP4: FP32 accumulator -> fc2_alpha -> BF16 -> per-16 BF16 amax
            -> E2M1(value / (amax / 6)) -> source-rank data + scale planes
 K3: optional E2M1 dequantization by (amax / 6) -> FP32 top-k reduction -> BF16
 ```
+
+The NVFP4 K2 epilogue quantizes each lane's own accumulator pairs and
+transposes packed nibbles with four shuffles. On the P2P path, when
+`hidden` is divisible by 256 and `ready_queue_bundle` is divisible by four,
+a shared-memory transpose retains both data and scales for four H64 tiles.
+Four adjacent lanes each write 32 bytes to the same token's contiguous
+128-byte H256 data row; the first lane also writes its 32-byte scale vector.
+This amortizes the gather/reuse barriers over four tiles and improves
+contiguous lane coverage for peer writes. The queue assigns each complete
+bundle to one CTA, and K3 runs after K2 finishes, so delayed publication
+preserves the existing synchronization and wire format. Other bundles and
+transport modes publish each H64 tile immediately; a half H64 tile uses
+16-byte data and 4-byte scale stores. Shared-memory stage selection accounts
+for both retained planes (20 KiB total for N128 with four-tile batching).
+The BF16 rounding, per-16 amax, and E2M1 encoding are unchanged.
+
+At EP4 with H=6144, post-SwiGLU intermediate=2304, 128 experts, top-k=8,
+and 6045 tokens/rank, three interleaved native CUDA-event runs per variant
+(20 warmups, 100 iterations) reduced median critical-rank compute-graph
+latency from 14.521 ms with immediate H64 data stores to 11.908 ms with
+four-tile data batching (18.00%). Explicit `dispatch_warps=1, k2_stages=3`
+then reached 11.364 ms (21.74% below that starting FP4 baseline). These are
+incremental gains over the preceding packed-shuffle/scale-store change,
+under the existing 350 W limits; staging, JIT, and profiling are excluded.
+The tuning knobs remain explicit, and the BF16 path is unchanged.
 
 `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const` are explicit per-expert inputs.
 They are part of the NVFP4 numerical contract and must not be folded into a
@@ -255,3 +329,94 @@ W4A8 or W8A8 compiled-kernel cache entry.
 
 `green_graph` is the default production launch mode. `sequential` remains only
 for bring-up and debugging.
+
+### Explicit fused FP4 quantization epilogue
+
+`k2_fused_quant_pack=true` combines BF16 rounding, packed BF16 block-max
+reduction, scale reciprocal, and FP4 packing in one PTX region. The option is
+default-off and requires direct-P2P EP2/EP4 FP4 combine with K2 tile
+`(64, 128, 128)`. It preserves the per-route quantization formula and output
+bits. Globaltimer diagnostics use the original scalar epilogue.
+
+For the EP4 H6144/I2304/top-k8 case, use this option with the preceding
+register-prefetch configuration and `k1_sms=70, k2_sms=40`. Two interleaved
+native runs on GPUs 4–7 measured approximately 2.0% and 2.6% lower complete
+graph latency at 6,045 and 81,450 tokens/rank, respectively, relative to the
+previous 66/44 configuration on the same GPUs. GPU7 ran at 1942 MHz, so
+absolute times and the best partition must be rechecked on other GPU groups.
+EP2 did not improve over its preceding 68/42 configuration; keep this option
+off there unless retuning establishes a gain.
+
+The separate rank-local FP4 prototype changes the quantization order and is
+retained under `.benchmark_reports/sm120_fp4_combine_round5_20260911/`; it is
+not selected by this option.
+
+### Performance versus BF16 combine
+
+The following September 11, 2026 measurements compare this implementation's
+per-route FP4 combine with the existing tuned BF16 rank-local combine.
+Both paths use NVFP4 GEMMs and return BF16. These are complete compute-graph
+latencies, including reset, concurrent K1/K2, and K3, rather than isolated
+combine timings. Input quantization, staging, JIT, graph capture, validation,
+and output copies are excluded.
+
+| EP | Tokens/rank | BF16 graph P50 (ms) | FP4 graph P50 (ms) | FP4 latency reduction vs BF16 |
+| --- | ---: | ---: | ---: | ---: |
+| 2 | 6,045 | 9.341448 | 9.084488 | +2.75% |
+| 2 | 81,450 | 120.446289 | 123.371862 | -2.43% |
+| 4 | 6,045 | 10.548768 | 10.870224 | -3.05% |
+| 4 | 81,450 | 137.611637 | 142.354900 | -3.45% |
+
+Reduction is `100 * (1 - FP4 / BF16)`; negative values mean FP4 is slower.
+Each entry is the median of two interleaved run P50s, with 20 warmups and
+100 native CUDA-event samples per run. Each sample uses the slowest rank.
+The workload has H=6144, post-SwiGLU I=2304, 128 experts, top-k=8, and q=1
+routing: all eight routes for a token share one destination rank. Measurements
+used 110-SM SM120 GPUs 4/5 for EP2 and 4-7 for EP4 on
+`R6KD-CX8aaS-GPU-09`, under the existing 350 W limits. GPU7 remained at
+1942 MHz; clocks and power settings were not changed. These results should
+not be mixed with the earlier GPU0-3 measurements above.
+
+Both formats use `dispatch_rank_cache=true`, `dispatch_warps=1`,
+`k1_stages=5`, `ready_queue_bundle=12`, K1/K2 tiles `(64, 128, 128)`,
+and `tx_sms=rx_sms=0`. The remaining explicit settings are:
+
+| Setting | BF16 EP2/EP4 | FP4 EP2 | FP4 EP4 |
+| --- | --- | --- | --- |
+| `rank_local_combine` | true | false | false |
+| `k1_sms` / `k2_sms` | 72 / 38 | 68 / 42 | 70 / 40 |
+| `k2_stages` | 4 | 3 | 3 |
+| `k2_register_prefetch` | false | true | true |
+| `k2_fused_quant_pack` | false | false | true |
+
+These compare tuned configurations, so the differences include scheduling
+as well as the combine format. FP4 preserves its per-route quantization
+formula; it is not numerically equivalent to BF16 combine. Recorded runs
+checked complete output bits against each format's frozen reference before
+and after timing. The separate rank-local FP4 prototype and its later
+nine-point results are not measurements of this production path.
+
+The source measurements are archived locally in
+`sm120_fp4_combine_round5_20260911/formal{0,1}_{bf16,fp4,fused70}_ep{2,4}.csv`.
+Use `fp4` for the EP2 comparison and `fused70` for EP4. To reproduce the
+production graph timing, run the repository benchmark with the settings
+above; for example, FP4 EP4:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 NVSHMEM_HEAP_KIND=VIDMEM NVSHMEM_SYMMETRIC_SIZE=16G \
+  torchrun --standalone --nproc-per-node=4 \
+  benchmarks/bench_moe_ep_sm120_nvfp4_mega.py \
+  --target graph --combine-dtype nvfp4 --m-values 48360,651600 \
+  --hidden 6144 --intermediate 2304 --num-experts 128 --top-k 8 \
+  --warmup 20 --iters 100 \
+  --knobs-json '{"dispatch_rank_cache":true,"dispatch_warps":1,"k1_stages":5,"k2_stages":3,"ready_queue_bundle":12,"k1_sms":70,"k2_sms":40,"tx_sms":0,"rx_sms":0,"k2_register_prefetch":true,"k2_fused_quant_pack":true}'
+```
+
+For BF16, use `--combine-dtype bf16` and its settings from the table. For
+EP2, use two GPUs, `--nproc-per-node=2`, and the EP2 settings. `--m-values`
+is tokens/rank multiplied by top-k. Repeat the formats in alternating order
+to compare run P50s. The shared Green Context helper also serves BF16, but
+retains the original CUDA split whenever it already matches the requested
+SM count, including the measured 72/38 BF16 configuration. The additional
+checks execute during setup/capture, not graph replay; this is not a measured
+before/after guarantee of BF16 performance on every device or partition.

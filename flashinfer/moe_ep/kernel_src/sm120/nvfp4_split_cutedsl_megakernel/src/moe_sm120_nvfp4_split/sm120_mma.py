@@ -258,6 +258,56 @@ def pack_e2m1x2(
 
 
 @dsl_user_op
+def pack_combine_e2m1(value0, value1, value2, value3, *, loc=None, ip=None):
+    """Pack two 16-hidden rows from the swap-AB MMA accumulator layout.
+
+    Lane ``4*g+t`` owns hidden ``g`` and ``g+8`` of tokens ``2*t`` and
+    ``2*t+1``. Quantize each lane's own values before exchanging packed bits:
+    four shuffles transpose the nibbles into four words, versus exchanging
+    four FP32 values and then gathering twelve individual packed bytes.
+    All lanes participate; only the four lanes with ``g == 0`` store results.
+    """
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([cutlass.Int32.mlir_type] * 4),
+        [v.ir_value(loc=loc, ip=ip) for v in (value0, value1, value2, value3)],
+        "{\n"
+        "  .reg .b8 b0, b1;\n"
+        "  .reg .b32 packed, lo, hi, peer, row0, row1, peer0, peer1;\n"
+        "  cvt.rn.satfinite.e2m1x2.f32 b0, $6, $4;\n"
+        "  cvt.rn.satfinite.e2m1x2.f32 b1, $7, $5;\n"
+        "  mov.b32 packed, {b0, b0, b1, b1};\n"
+        "  and.b32 lo, packed, 0x000f000f;\n"
+        "  and.b32 hi, packed, 0x00f000f0;\n"
+        "  shl.b32 hi, hi, 4;\n"
+        "  or.b32 packed, lo, hi;\n"
+        "  shfl.sync.bfly.b32 peer, packed, 4, 31, -1;\n"
+        "  shl.b32 peer, peer, 4;\n"
+        "  or.b32 packed, packed, peer;\n"
+        "  shfl.sync.bfly.b32 peer, packed, 8, 31, -1;\n"
+        "  prmt.b32 row0, packed, peer, 0x5140;\n"
+        "  prmt.b32 row1, packed, peer, 0x7362;\n"
+        "  shfl.sync.bfly.b32 peer0, row0, 16, 31, -1;\n"
+        "  shfl.sync.bfly.b32 peer1, row1, 16, 31, -1;\n"
+        "  prmt.b32 $0, row0, peer0, 0x5410;\n"
+        "  prmt.b32 $1, row0, peer0, 0x7632;\n"
+        "  prmt.b32 $2, row1, peer1, 0x5410;\n"
+        "  prmt.b32 $3, row1, peer1, 0x7632;\n"
+        "}",
+        "=r,=r,=r,=r,f,f,f,f",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        cutlass.Int32(
+            llvm.extractvalue(cutlass.Int32.mlir_type, result, [i], loc=loc, ip=ip)
+        )
+        for i in range(4)
+    )
+
+
+@dsl_user_op
 def _arch_mma_m16n8k64_nvfp4(
     acc: cute.Tensor,
     a_reg: cute.Tensor,
@@ -550,3 +600,87 @@ def issue_m64n8k128_nvfp4(
             b_dtype=b_dtype,
             sf_dtype=sf_dtype,
         )
+
+
+@dsl_user_op
+def fused_combine_quant_pack(v0, v1, v2, v3, *, loc=None, ip=None):
+    """Encode two 16-value BF16-rounded blocks distributed across eight lanes.
+
+    Lane groups differ in bits 2, 3, and 4, matching ``pack_combine_e2m1``.
+    Packed BF16 max halves share three shuffles; the scale and reciprocal
+    formula match the scalar combine epilogue. Only lanes 0..3 store results.
+    """
+    types = [cutlass.Int32.mlir_type] * 4 + [cutlass.Float32.mlir_type] * 2
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal(types),
+        [v.ir_value(loc=loc, ip=ip) for v in (v0, v1, v2, v3)],
+        r"""
+{
+ .reg .b32 p0, p1, amax, peer, packed, lo, hi, row0, row1, peer0, peer1;
+ .reg .b8 b0, b1;
+ .reg .f32 v0, v1, v2, v3, s0, s1, r0, r1, g0, g1;
+ cvt.rn.bf16x2.f32 p0, $7, $6;
+ cvt.rn.bf16x2.f32 p1, $9, $8;
+ shl.b32 v0, p0, 16;
+ and.b32 v1, p0, 0xffff0000;
+ shl.b32 v2, p1, 16;
+ and.b32 v3, p1, 0xffff0000;
+ max.xorsign.abs.bf16x2 amax, p0, p1;
+ shfl.sync.bfly.b32 peer, amax, 4, 31, -1;
+ max.xorsign.abs.bf16x2 amax, amax, peer;
+ shfl.sync.bfly.b32 peer, amax, 8, 31, -1;
+ max.xorsign.abs.bf16x2 amax, amax, peer;
+ shfl.sync.bfly.b32 peer, amax, 16, 31, -1;
+ max.xorsign.abs.bf16x2 amax, amax, peer;
+ and.b32 amax, amax, 0x7fff7fff;
+ shl.b32 $4, amax, 16;
+ and.b32 $5, amax, 0xffff0000;
+ mul.rn.f32 s0, $4, 0f3e2aaaab;
+ mul.rn.f32 s1, $5, 0f3e2aaaab;
+ rcp.approx.ftz.f32 r0, s0;
+ rcp.approx.ftz.f32 r1, s1;
+ min.f32 r0, r0, 0f7f7fffff;
+ min.f32 r1, r1, 0f7f7fffff;
+ mul.rn.f32 g0, s0, 0f7149f2ca;
+ mul.rn.f32 g1, s1, 0f7149f2ca;
+ min.f32 g0, g0, 0f3f800000;
+ min.f32 g1, g1, 0f3f800000;
+ mul.rn.f32 r0, r0, g0;
+ mul.rn.f32 r1, r1, g1;
+ mul.rn.f32 v0, v0, r0;
+ mul.rn.f32 v1, v1, r1;
+ mul.rn.f32 v2, v2, r0;
+ mul.rn.f32 v3, v3, r1;
+ cvt.rn.satfinite.e2m1x2.f32 b0, v2, v0;
+ cvt.rn.satfinite.e2m1x2.f32 b1, v3, v1;
+ mov.b32 packed, {b0, b0, b1, b1};
+ and.b32 lo, packed, 0x000f000f;
+ and.b32 hi, packed, 0x00f000f0;
+ shl.b32 hi, hi, 4;
+ or.b32 packed, lo, hi;
+ shfl.sync.bfly.b32 peer, packed, 4, 31, -1;
+ shl.b32 peer, peer, 4;
+ or.b32 packed, packed, peer;
+ shfl.sync.bfly.b32 peer, packed, 8, 31, -1;
+ prmt.b32 row0, packed, peer, 0x5140;
+ prmt.b32 row1, packed, peer, 0x7362;
+ shfl.sync.bfly.b32 peer0, row0, 16, 31, -1;
+ shfl.sync.bfly.b32 peer1, row1, 16, 31, -1;
+ prmt.b32 $0, row0, peer0, 0x5410;
+ prmt.b32 $1, row0, peer0, 0x7632;
+ prmt.b32 $2, row1, peer1, 0x5410;
+ prmt.b32 $3, row1, peer1, 0x7632;
+}
+        """,
+        "=r,=r,=r,=r,=f,=f,f,f,f,f",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(
+        (cutlass.Int32 if i < 4 else cutlass.Float32)(
+            llvm.extractvalue(types[i], result, [i], loc=loc, ip=ip)
+        )
+        for i in range(6)
+    )

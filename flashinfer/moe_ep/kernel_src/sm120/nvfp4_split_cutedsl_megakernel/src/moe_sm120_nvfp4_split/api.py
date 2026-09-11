@@ -121,17 +121,47 @@ class MegaMoECompileSpec:
         self.build.validate()
         if self.kernel.rank_local_combine and self.build.combine_format != "bf16":
             raise ValueError("rank_local_combine requires BF16 combine")
+        if self.kernel.k2_register_prefetch and not (
+            self.build.combine_format == "16e2m1xbf16"
+            and self.kernel.kernel_comm_backend == "p2p_direct"
+            and self.problem.expert_parallel_size in (2, 4)
+            and self.kernel.k2_tile == (64, 128, 128)
+        ):
+            raise ValueError(
+                "k2_register_prefetch requires EP2/EP4 direct-P2P FP4 combine "
+                "with K2 tile (64, 128, 128)"
+            )
+        if self.kernel.k2_fused_quant_pack and not (
+            self.build.combine_format == "16e2m1xbf16"
+            and self.kernel.kernel_comm_backend == "p2p_direct"
+            and self.problem.expert_parallel_size in (2, 4)
+            and self.kernel.k2_tile == (64, 128, 128)
+        ):
+            raise ValueError(
+                "k2_fused_quant_pack requires EP2/EP4 direct-P2P FP4 combine "
+                "with K2 tile (64, 128, 128)"
+            )
+        compact_fp4_k1 = (
+            self.build.combine_format == "16e2m1xbf16"
+            and self.kernel.kernel_comm_backend == "p2p_direct"
+            and self.problem.expert_parallel_size in (2, 4)
+            and self.kernel.dispatch_warps == 1
+            and self.kernel.k1_tile == (64, 128, 128)
+            and self.kernel.k1_stages == 5
+        )
         if (
             self.kernel.k1_stages is not None
             and self.kernel.k1_stages > 2
             and self.problem.expert_parallel_size > 1
             and not self.kernel.rank_local_combine
+            and not compact_fp4_k1
         ):
-            # The route-level peer publication path did not pass replay
-            # consistency with a deeper K1 pipeline. Rank-local publication
-            # uses an explicit completion/acquire protocol and is validated.
+            # Keep the replay guard for ordinary CTAs. The FP4 exception uses
+            # compact K1's register pipeline and is validated only at stage5
+            # on EP2/EP4; it does not enable other deep route-level paths.
             raise ValueError(
-                "k1_stages > 2 requires rank_local_combine for multi-rank execution"
+                "k1_stages > 2 requires rank_local_combine or the EP2/EP4 "
+                "FP4 compact K1 configuration (one dispatcher, N128, stage5)"
             )
         if self.kernel.total_sms <= 0:
             raise ValueError("kernel SM partition must be non-empty")
@@ -285,6 +315,8 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         k2_ready_queue=config.k2_ready_queue,
         k2_ready_queue_bundle=config.ready_queue_bundle,
         k2_natural_regs=config.k2_natural_regs,
+        k2_register_prefetch=config.k2_register_prefetch,
+        k2_fused_quant_pack=config.k2_fused_quant_pack,
         k2_min_blocks_per_sm=config.k2_min_blocks_per_sm,
         k1_ready_queue_m_rotation=config.k1_ready_queue_m_rotation,
         jit_config=spec.jit,
