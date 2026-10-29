@@ -298,7 +298,7 @@ def _moe_core_impl(
     gemm2_mma_tiler: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     # GEMM2 store-warp epilogue (Blackwell): raster order and
-    # (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints[, enable_3x_mma]]);
+    # (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]);
     # None keeps the default.
     gemm2_raster_along_m: bool = False,
     gemm2_epilogue: Optional[Tuple[int, ...]] = None,
@@ -333,7 +333,6 @@ def _moe_core_impl(
     situ_linear_beta: Optional[float] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     weight_dtype: Optional[str] = None,
-    fc2_tma_config: Optional[Tuple[int, int, bool, int]] = None,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
 
@@ -341,12 +340,6 @@ def _moe_core_impl(
     ``"float4_e2m1fn"`` (packed FP4, the W4A4/W4A8 modes) or ``"float8_e4m3fn"``
     (the ``mxfp8`` mode; only valid with MXFP8 activations). When ``None`` it is
     inferred from ``w1_weight.dtype`` (``float8_e4m3fn`` selects FP8 weights).
-
-    ``fc2_tma_config`` is an internal opt-in experiment: (C stages, store
-    warps, raster along M, swizzle). It writes contiguous BF16 expert outputs
-    with 2-D TMA and then runs the routing-weight reduction. Both kernels and
-    the intermediate workspace belong to FC2; the normal fused path is the
-    default. Currently limited to per-tensor W4A4 with BF16 output on SM100/103.
 
     This function handles:
     1. moe_sort: Token routing computation
@@ -386,11 +379,10 @@ def _moe_core_impl(
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
         gemm2_raster_along_m: GEMM2 tile raster order.
         gemm2_epilogue: Optional GEMM2 store-warp epilogue
-            (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints[, enable_3x_mma]]);
+            (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]);
             dedicated warps issue the output writes so they overlap the next
             tile's math, and use_l2_hints (default False) loads A evict-first
             and reduces the output evict-last in L2.
-            enable_3x_mma (default False) selects the SM103 K96 FP4 mainloop.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
@@ -781,39 +773,6 @@ def _moe_core_impl(
             sf_vec_size=16,
         )
 
-    if fc2_tma_config is not None:
-        if (
-            is_mxfp8
-            or use_per_token_activation
-            or use_localized_path
-            or output_dtype != torch.bfloat16
-            or not use_fused_finalize
-            or gemm2_mma_tiler_mn != (256, 256)
-            or gemm2_cluster_shape_mn != (2, 1)
-        ):
-            raise NotImplementedError(
-                "TMA FC2 requires per-tensor W4A4, BF16 output, the 256x256 "
-                "2-CTA tile, and an unsplit final output"
-            )
-        from .tma_fc2 import tma_fc2
-
-        return tma_fc2(
-            a=intermediate,
-            b=w2_weight,
-            a_scale=intermediate_sf,
-            b_scale=w2_weight_sf,
-            alpha=w2_alpha,
-            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-            num_non_exiting_tiles=num_non_exiting_tiles,
-            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
-            token_final_scales=token_final_scales,
-            out=moe_output[:num_tokens],
-            config=fc2_tma_config,
-            enable_pdl=enable_pdl,
-        )[:num_tokens]
-
     # Atomic finalize requires a zeroed token output. Deterministic finalize
     # writes each route to a unique expanded row.
     if use_fused_finalize:
@@ -919,11 +878,6 @@ def _moe_core_impl(
                 gemm2_epilogue is not None
                 and len(gemm2_epilogue) > 3
                 and bool(gemm2_epilogue[3])
-            ),
-            enable_3x_mma=(
-                gemm2_epilogue is not None
-                and len(gemm2_epilogue) > 4
-                and bool(gemm2_epilogue[4])
             ),
         )
 

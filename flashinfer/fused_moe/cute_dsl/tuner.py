@@ -24,7 +24,7 @@ Tactic format follows TRT-LLM's style and is architecture-dependent:
 - Blackwell (SM100): tactic = (mma_tiler_mn, cluster_shape_mn, raster_along_m)
   for both GEMM1 (Gather + FC1 activation) and GEMM2 (Finalize). A GEMM2
   tactic may carry a 4th element, the store-warp/swizzle epilogue
-  (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints[, enable_3x_mma]]).
+  (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]).
 - Rubin (SM107): tactic = (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
@@ -108,8 +108,7 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     (bug #3067, fixed upstream by #3171).
 
     Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m), optionally followed
-    by an epilogue (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints
-    [, enable_3x_mma]]);
+    by an epilogue (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]);
     see BLACKWELL_GEMM2_EPILOGUE_CANDIDATES.
     """
     mma_tiler_mn_candidates = [(tile_size, 128), (tile_size, 256)]
@@ -466,7 +465,7 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
     else:
         gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, gemm1_raster_along_m = gemm1_tactic
         # An optional 4th element selects the GEMM2 store-warp epilogue:
-        # (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints[, enable_3x_mma]]).
+        # (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]).
         (
             gemm2_mma_tiler_mn,
             gemm2_cluster_shape_mn,

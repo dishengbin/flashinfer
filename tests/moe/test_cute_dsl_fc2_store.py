@@ -3,6 +3,8 @@
 
 """Fused FC2 store stages across route tails, empty experts and graph replay."""
 
+import importlib
+
 import pytest
 import torch
 
@@ -10,7 +12,13 @@ from .utils import create_moe_tensors
 
 
 @pytest.mark.parametrize(
-    "tokens,hidden,enable_pdl", [(17, 256, False), (257, 384, True)]
+    "tokens,hidden,inter,enable_pdl",
+    [
+        (17, 256, 256, False),
+        (257, 384, 256, True),
+        (17, 256, 768, True),
+        (17, 256, 1536, False),
+    ],
 )
 @pytest.mark.parametrize(
     "epilogue",
@@ -31,7 +39,9 @@ from .utils import create_moe_tensors
     ],
 )
 @pytest.mark.parametrize("fused", [False, True])
-def test_fc2_store_routing_and_replay(tokens, hidden, enable_pdl, epilogue, fused):
+def test_fc2_store_routing_and_replay(
+    tokens, hidden, inter, enable_pdl, epilogue, fused
+):
     if len(epilogue) > 3 and epilogue[3] and not fused:
         pytest.skip("L2 output hints require the fused BF16 reduction")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
@@ -42,7 +52,7 @@ def test_fc2_store_routing_and_replay(tokens, hidden, enable_pdl, epilogue, fuse
     from flashinfer import cute_dsl_fused_moe
     from flashinfer.fused_moe.cute_dsl.fused_moe import _moe_core_impl
 
-    tensors = create_moe_tensors(tokens, hidden, 256, 8, 8, 2)
+    tensors = create_moe_tensors(tokens, hidden, inter, 8, 8, 2)
     names = (
         "x",
         "x_sf",
@@ -106,6 +116,65 @@ def test_fc2_store_routing_and_replay(tokens, hidden, enable_pdl, epilogue, fuse
     inputs["w2_alpha"].mul_(1.1)
     graph.replay()
     check(captured)
+
+
+@pytest.mark.parametrize("stages,warps", [(1, 8), (2, 2), (2, 16)])
+def test_fc2_store_empty_schedule(monkeypatch, stages, warps):
+    """A sentinel-only store stream must terminate without touching output."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    core = importlib.import_module("flashinfer.fused_moe.cute_dsl.fused_moe")
+    fc2 = core.blockscaled_contiguous_grouped_gemm_finalize_fusion
+    tensors = create_moe_tensors(17, 384, 768, 8, 8, 2)
+    names = (
+        "x",
+        "x_sf",
+        "token_selected_experts",
+        "token_final_scales",
+        "w1_weight",
+        "w1_weight_sf",
+        "w1_alpha",
+        "fc2_input_scale",
+        "w2_weight",
+        "w2_weight_sf",
+        "w2_alpha",
+    )
+    operands = {}
+
+    def capture_fc2(**kwargs):
+        operands.update(kwargs)
+        return kwargs["out"]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            core, "blockscaled_contiguous_grouped_gemm_finalize_fusion", capture_fc2
+        )
+        core._moe_core_impl(
+            **{name: tensors[name] for name in names},
+            num_experts=8,
+            num_local_experts=8,
+            top_k=2,
+            tile_size=256,
+            gemm1_mma_tiler_mn=(256, 256),
+            gemm1_cluster_shape_mn=(2, 1),
+            gemm2_mma_tiler_mn=(256, 256),
+            gemm2_cluster_shape_mn=(2, 1),
+            gemm2_epilogue=(stages, warps, 4, False),
+            use_async_memset=False,
+        )
+
+    operands["num_non_exiting_tiles"].zero_()
+    operands["out"].fill_(1)
+    fc2(**operands)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fc2(**operands)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all(operands["out"] == 1)
 
 
 @pytest.mark.parametrize(

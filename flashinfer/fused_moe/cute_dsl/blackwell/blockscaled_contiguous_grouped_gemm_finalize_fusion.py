@@ -38,7 +38,6 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from . import sm103_mma
 from .utils import (
     blk_copy,
     blk_reduce_bf16,
@@ -373,7 +372,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         num_store_warps: int = 0,
         swizzle_size: int = 1,
         use_l2_hints: bool = False,
-        enable_3x_mma: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -409,19 +407,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :param use_l2_hints: Load A evict-first and reduce the output
             evict-last in L2. Requires num_store_warps > 0.
         :type use_l2_hints: bool
-        :param enable_3x_mma: Use SM103 K96 MMA over the packed K256 TMA
-            buffers. Requires block-16 FP4 inputs and logical K divisible
-            by 768. Kept opt-in because its latency depends on the pipeline.
-        :type enable_3x_mma: bool
         """
 
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
-        self.enable_3x_mma = enable_3x_mma
-        if enable_3x_mma and mma_tiler_mn != (256, 256):
-            raise ValueError("SM103 K96 FC2 currently requires a (256, 256) MMA tile")
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -658,18 +649,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.num_ab_stage,
         )
 
-        if self.enable_3x_mma:
-            # The K96 descriptor consumes packed bytes with 128B swizzling.
-            # TMA uses a byte view; retain the FP4 view for storage accounting.
-            self.a_smem_layout_staged = cute.make_composed_layout(
-                cute.make_swizzle(3, 5, 3), 0, self.a_smem_layout_staged.outer
-            )
-            self.b_smem_layout_staged = cute.make_composed_layout(
-                cute.make_swizzle(3, 5, 3), 0, self.b_smem_layout_staged.outer
-            )
-            if self.num_ab_stage < 2:
-                raise ValueError("SM103 K96 FC2 requires at least two A/B stages")
-
         swizzled_pad = 16 // (self.out_dtype.width // 8)
         self.c_smem_layout_staged = cute.make_layout(
             (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], self.num_c_stage),
@@ -691,11 +670,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.num_sfb_tmem_cols = (
             self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn
         ) * mma_inst_tile_k
-        if self.enable_3x_mma:
-            # Two K96 MMAs share twelve scales rather than the sixteen
-            # scales used by one K256 storage tile. Recycle this SF window.
-            self.num_sfa_tmem_cols = self.num_sfa_tmem_cols * 3 // 4
-            self.num_sfb_tmem_cols = self.num_sfb_tmem_cols * 3 // 4
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage
@@ -829,48 +803,38 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        if cutlass.const_expr(self.enable_3x_mma):
-            tma_atom_a, tma_tensor_a = sm103_mma.make_tma_atom(
-                a_op, a, tiled_mma, self.cluster_shape_mn[1], "a"
-            )
-        else:
-            tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-                a_op,
-                a,
-                a_smem_layout,
-                self.mma_tiler,
-                tiled_mma,
-                self.cluster_layout_vmnk.shape,
-                internal_type=(
-                    self.smem_alloc_a_dtype
-                    if self.needs_unpack and self.a_dtype.width < 8
-                    else None
-                ),
-            )
+        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+            a_op,
+            a,
+            a_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
+            internal_type=(
+                self.smem_alloc_a_dtype
+                if self.needs_unpack and self.a_dtype.width < 8
+                else None
+            ),
+        )
 
         # Setup TMA load for B
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        if cutlass.const_expr(self.enable_3x_mma):
-            tma_atom_b, tma_tensor_b = sm103_mma.make_tma_atom(
-                b_op, b, tiled_mma, self.cluster_shape_mn[0] // atom_thr_size, "b"
-            )
-        else:
-            tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-                b_op,
-                b,
-                b_smem_layout,
-                self.mma_tiler,
-                tiled_mma,
-                self.cluster_layout_vmnk.shape,
-                internal_type=(
-                    self.smem_alloc_b_dtype
-                    if self.needs_unpack and self.b_dtype.width < 8
-                    else None
-                ),
-            )
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            b_op,
+            b,
+            b_smem_layout,
+            self.mma_tiler,
+            tiled_mma,
+            self.cluster_layout_vmnk.shape,
+            internal_type=(
+                self.smem_alloc_b_dtype
+                if self.needs_unpack and self.b_dtype.width < 8
+                else None
+            ),
+        )
 
         # Setup TMA load for SFA
         sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
@@ -1391,18 +1355,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         #
         # Local_tile partition global tensors
         #
-        # The SM103 TMA tensors address packed bytes; SF tensors retain
-        # their original logical FP4 K dimension.
-        ab_tiler = self.mma_tiler
-        if cutlass.const_expr(self.enable_3x_mma):
-            ab_tiler = (*self.mma_tiler[:2], self.mma_tiler[2] // 2)
         # (bM, bK, loopM, loopK, loopL)
         gA_mkl = cute.local_tile(
-            mA_mkl, cute.slice_(ab_tiler, (None, 0, None)), (None, None, None)
+            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
         )
         # (bN, bK, loopN, loopK, loopL)
         gB_nkl = cute.local_tile(
-            mB_nkl, cute.slice_(ab_tiler, (0, None, None)), (None, None, None)
+            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
         )
 
         # (bM, bK, RestM, RestK, RestL)
@@ -1436,11 +1395,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         #
         # Partition global/shared tensor for TMA load A/B
         #
-        ab_sA, ab_sB = sA, sB
-        if cutlass.const_expr(self.enable_3x_mma):
-            ab_sA = sm103_mma.packed_smem_view(sA, self.num_ab_stage)
-            ab_sB = sm103_mma.packed_smem_view(sB, self.num_ab_stage)
-
         # TMA load A partition_S/D
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -1451,7 +1405,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tma_atom_a,
             block_in_cluster_coord_vmnk[2],
             a_cta_layout,
-            cute.group_modes(ab_sA, 0, 3),
+            cute.group_modes(sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
         # TMA load B partition_S/D
@@ -1464,7 +1418,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tma_atom_b,
             block_in_cluster_coord_vmnk[1],
             b_cta_layout,
-            cute.group_modes(ab_sB, 0, 3),
+            cute.group_modes(sB, 0, 3),
             cute.group_modes(tCgB, 0, 3),
         )
 
@@ -1504,10 +1458,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Partition shared/tensor memory tensor for TiledMMA_A/B/C
         #
         # (MMA, MMA_M, MMA_K, STAGE)
-        tCrA, tCrB = None, None
-        if cutlass.const_expr(not self.enable_3x_mma):
-            tCrA = tiled_mma.make_fragment_A(sA)
-            tCrB = tiled_mma.make_fragment_B(sB)
+        tCrA = tiled_mma.make_fragment_A(sA)
+        # (MMA, MMA_N, MMA_K, STAGE)
+        tCrB = tiled_mma.make_fragment_B(sB)
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
@@ -1922,28 +1875,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 tCtSFB_compact_s2t,
             ) = self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
 
-            if cutlass.const_expr(self.enable_3x_mma):
-                native_mma = sm100_utils.sm103_make_blockscaled_trivial_tiled_mma(
-                    self.sf_dtype,
-                    self.sf_vec_size,
-                    self.cta_group,
-                    self.mma_inst_shape_mn,
-                )
-                tCtSFA_native = sm103_mma.sf_mma_view(
-                    native_mma,
-                    sfa_tmem_ptr,
-                    self.mma_tiler,
-                    self.cta_tile_shape_mnk[0],
-                    False,
-                )
-                tCtSFB_native = sm103_mma.sf_mma_view(
-                    native_mma,
-                    sfb_tmem_ptr,
-                    self.mma_tiler,
-                    self.cta_tile_shape_mnk_sfb[1],
-                    True,
-                )
-
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
@@ -2034,105 +1965,78 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 # Mma mainloop
                 #
-                if cutlass.const_expr(self.enable_3x_mma):
+                for k_tile in cutlass.range(k_tile_cnt):  # noqa: B007
                     if is_leader_cta:
-                        ab_consumer_state = sm103_mma.mainloop(
-                            native_mma,
-                            tCtAcc,
-                            ab_sA,
-                            ab_sB,
-                            tiled_copy_s2t_sfa,
-                            tCsSFA_compact_s2t,
-                            tCtSFA_compact_s2t,
-                            tiled_copy_s2t_sfb,
-                            tCsSFB_compact_s2t,
-                            tCtSFB_compact_s2t,
-                            tCtSFA_native,
-                            tCtSFB_native,
-                            ab_pipeline,
-                            ab_consumer_state,
-                            peek_ab_full_status,
-                            k_tile_cnt,
+                        # Conditionally wait for AB buffer full
+                        ab_pipeline.consumer_wait(
+                            ab_consumer_state, peek_ab_full_status
                         )
-                else:
-                    for k_tile in cutlass.range(k_tile_cnt):  # noqa: B007
-                        if is_leader_cta:
-                            # Conditionally wait for AB buffer full
-                            ab_pipeline.consumer_wait(
-                                ab_consumer_state, peek_ab_full_status
-                            )
 
-                            #  Copy SFA/SFB from smem to tmem
-                            s2t_stage_coord = (
+                        #  Copy SFA/SFB from smem to tmem
+                        s2t_stage_coord = (
+                            None,
+                            None,
+                            None,
+                            None,
+                            ab_consumer_state.index,
+                        )
+                        tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
+                        tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
+                        cute.copy(
+                            tiled_copy_s2t_sfa,
+                            tCsSFA_compact_s2t_staged,
+                            tCtSFA_compact_s2t,
+                        )
+                        cute.copy(
+                            tiled_copy_s2t_sfb,
+                            tCsSFB_compact_s2t_staged,
+                            tCtSFB_compact_s2t,
+                        )
+
+                        # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
+                        num_kblocks = cute.size(tCrA, mode=[2])
+
+                        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+                            kblock_coord = (
                                 None,
                                 None,
-                                None,
-                                None,
+                                kblock_idx,
                                 ab_consumer_state.index,
                             )
-                            tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[
-                                s2t_stage_coord
-                            ]
-                            tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[
-                                s2t_stage_coord
-                            ]
-                            cute.copy(
-                                tiled_copy_s2t_sfa,
-                                tCsSFA_compact_s2t_staged,
-                                tCtSFA_compact_s2t,
+
+                            # Set SFA/SFB tensor to tiled_mma
+                            sf_kblock_coord = (None, None, kblock_idx)
+                            tiled_mma.set(
+                                tcgen05.Field.SFA,
+                                tCtSFA[sf_kblock_coord].iterator,
                             )
-                            cute.copy(
-                                tiled_copy_s2t_sfb,
-                                tCsSFB_compact_s2t_staged,
-                                tCtSFB_compact_s2t,
+                            tiled_mma.set(
+                                tcgen05.Field.SFB,
+                                tCtSFB_mma[sf_kblock_coord].iterator,
                             )
 
-                            # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
-                            num_kblocks = cute.size(tCrA, mode=[2])
+                            cute.gemm(
+                                tiled_mma,
+                                tCtAcc,
+                                tCrA[kblock_coord],
+                                tCrB[kblock_coord],
+                                tCtAcc,
+                            )
 
-                            for kblock_idx in cutlass.range(
-                                num_kblocks, unroll_full=True
-                            ):
-                                kblock_coord = (
-                                    None,
-                                    None,
-                                    kblock_idx,
-                                    ab_consumer_state.index,
-                                )
+                            # Enable accumulate on tCtAcc after first kblock
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                                # Set SFA/SFB tensor to tiled_mma
-                                sf_kblock_coord = (None, None, kblock_idx)
-                                tiled_mma.set(
-                                    tcgen05.Field.SFA,
-                                    tCtSFA[sf_kblock_coord].iterator,
-                                )
-                                tiled_mma.set(
-                                    tcgen05.Field.SFB,
-                                    tCtSFB_mma[sf_kblock_coord].iterator,
-                                )
+                        # Async arrive AB buffer empty
+                        ab_pipeline.consumer_release(ab_consumer_state)
 
-                                cute.gemm(
-                                    tiled_mma,
-                                    tCtAcc,
-                                    tCrA[kblock_coord],
-                                    tCrB[kblock_coord],
-                                    tCtAcc,
-                                )
-
-                                # Enable accumulate on tCtAcc after first kblock
-                                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-
-                            # Async arrive AB buffer empty
-                            ab_pipeline.consumer_release(ab_consumer_state)
-
-                        # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
-                        ab_consumer_state.advance()
-                        peek_ab_full_status = cutlass.Boolean(1)
-                        if ab_consumer_state.count < k_tile_cnt:
-                            if is_leader_cta:
-                                peek_ab_full_status = ab_pipeline.consumer_try_wait(
-                                    ab_consumer_state
-                                )
+                    # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
+                    ab_consumer_state.advance()
+                    peek_ab_full_status = cutlass.Boolean(1)
+                    if ab_consumer_state.count < k_tile_cnt:
+                        if is_leader_cta:
+                            peek_ab_full_status = ab_pipeline.consumer_try_wait(
+                                ab_consumer_state
+                            )
 
                 #
                 # Async arrive accumulator buffer full(each kblock)

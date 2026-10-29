@@ -394,34 +394,6 @@ ordering because metadata lookahead did not consistently help them.
 `tests/moe/test_cute_dsl_fc2_store.py` covers routing tails,
 empty experts, non-unit alpha and graph replay with updated routing/scales.
 
-SM103 native K96 FC2 is opt-in through the finalize API's
-`enable_3x_mma=True`, or a fifth GEMM2 epilogue entry
-`(num_c_stage, num_store_warps, swizzle_size, use_l2_hints, enable_3x_mma)`.
-It requires packed FP4 A/B, block-16 scales, a `(256, 256)` MMA tile and
-logical K divisible by 768, plus a CuTe DSL build providing the SM103 MMA
-helper. The existing FC1/weight SF layouts are consumed directly. Byte TMA
-uses the K96 swizzle, and the mainloop keeps each K256 input buffer live
-through the MMA that crosses into its successor. Twelve scales are recycled
-after two MMAs. The K64 path remains the default: initial B300 measurements
-show that fewer MMA instructions alone do not improve complete FC2 latency.
-`benchmarks/bench_cute_dsl_moe_fc2_sm103.py` compares both paths with real FC1
-operands and randomized interleaved timing; its all-kernel sum is not elapsed
-MoE latency. `tests/moe/test_cute_dsl_fc2_sm103.py` covers repeated routes,
-empty experts, partial tiles, K768/K1536, deterministic finalize and graph
-replay with changed routing/scales. Lower-level FC2 tests also cover FP16
-and FP32 output; the full MoE API still supports FP16/BF16 output.
-
-The internal NVFP4 FC2 experiment in `fused_moe/cute_dsl/tma_fc2.py` is selected
-only by `_moe_core_impl(fc2_tma_config=(c_stages, store_warps, raster_m, swizzle))`.
-It retains the explored 128x64 2-D TMA stores and adds a separate routing-weight
-finalizer, because random output rows cannot share a contiguous TMA tile.
-Measure **both kernels together** as FC2 with CUDA events around the complete
-operation; summing kernel durations can double-count PDL overlap. Report the
-padded BF16 workspace alongside timing. This experiment remains opt-in.
-Correctness, non-unit expert alpha,
-partial/empty experts, and graph replay with updated routing are covered by
-`tests/moe/test_cute_dsl_fc2_tma.py`.
-
 `flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
 CuTe-DSL grouped FP8 API; `group_deepgemm_fp8_nt_groupwise` keeps its original
 DeepGEMM-only signature. Both use per-row expert indices, unlike the indptr-based
