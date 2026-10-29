@@ -297,6 +297,11 @@ def _moe_core_impl(
     gemm1_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_tiler: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
+    # GEMM2 store-warp epilogue (Blackwell): raster order and
+    # (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]);
+    # None keeps the default.
+    gemm2_raster_along_m: bool = False,
+    gemm2_epilogue: Optional[Tuple[int, ...]] = None,
     # Pre-allocated buffers (for CUDA graph)
     moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None,
     gemm1_out: Optional[torch.Tensor] = None,
@@ -372,6 +377,12 @@ def _moe_core_impl(
         gemm1_cluster_shape_mn: GEMM1 cluster shape.
         gemm2_mma_tiler_mn: GEMM2 MMA tiler shape.
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
+        gemm2_raster_along_m: GEMM2 tile raster order.
+        gemm2_epilogue: Optional GEMM2 store-warp epilogue
+            (num_c_stage, num_store_warps, swizzle_size[, use_l2_hints]);
+            dedicated warps issue the output writes so they overlap the next
+            tile's math, and use_l2_hints (default False) loads A evict-first
+            and reduces the output evict-last in L2.
         moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
@@ -788,6 +799,8 @@ def _moe_core_impl(
         )
 
     # Step 3: GEMM2 with optional atomic finalize
+    if gemm2_epilogue is not None and use_localized_path:
+        raise ValueError("gemm2_epilogue is not supported on the localized path")
     if use_localized_path:
         # Both domains read the joined FC1 output and write disjoint hidden
         # columns. Each contracts the full intermediate, so no reduction is needed.
@@ -855,6 +868,17 @@ def _moe_core_impl(
             mma_inst_shape=gemm2_mma_inst_shape,
             enable_pdl=enable_pdl,
             use_fused_finalize=use_fused_finalize,
+            raster_along_m=(
+                gemm2_raster_along_m if gemm2_epilogue is not None else False
+            ),
+            num_c_stage=gemm2_epilogue[0] if gemm2_epilogue is not None else 1,
+            num_store_warps=gemm2_epilogue[1] if gemm2_epilogue is not None else 0,
+            swizzle_size=gemm2_epilogue[2] if gemm2_epilogue is not None else 1,
+            use_l2_hints=(
+                gemm2_epilogue is not None
+                and len(gemm2_epilogue) > 3
+                and bool(gemm2_epilogue[3])
+            ),
         )
 
     # Step 4: Deterministic routing-weight reduction
@@ -1168,6 +1192,8 @@ class CuteDslMoEWrapper:
         enable_pdl: bool = True,
         use_async_memset: bool = True,
         nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+        gemm2_raster_along_m: bool = False,
+        gemm2_epilogue: Optional[Tuple[int, ...]] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""
@@ -1215,6 +1241,8 @@ class CuteDslMoEWrapper:
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
             nvfp4_4over6=nvfp4_4over6,
+            gemm2_raster_along_m=gemm2_raster_along_m,
+            gemm2_epilogue=gemm2_epilogue,
         )
 
     @flashinfer_api(trace=cute_dsl_moe_wrapper_run_trace)
@@ -1475,6 +1503,8 @@ def _cute_dsl_fused_moe_impl(
     localized_weights: Optional[list] = None,
     localized_streams: Optional[list] = None,
     sm_count: Optional[int] = None,
+    gemm2_raster_along_m: bool = False,
+    gemm2_epilogue: Optional[Tuple[int, ...]] = None,
 ) -> torch.Tensor:
     """Internal implementation called by auto-tuner for functional API."""
     return _moe_core_impl(
@@ -1520,6 +1550,8 @@ def _cute_dsl_fused_moe_impl(
         localized_weights=localized_weights,
         localized_streams=localized_streams,
         sm_count=sm_count,
+        gemm2_raster_along_m=gemm2_raster_along_m,
+        gemm2_epilogue=gemm2_epilogue,
     )
 
 

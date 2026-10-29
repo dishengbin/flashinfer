@@ -373,6 +373,27 @@ median_time_ms = statistics.median(times)
 
 → **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/SKILL.md`](.claude/skills/benchmark-kernel/SKILL.md)**
 
+Blackwell fused FC2 supports dedicated store warps, staged C buffers and
+swizzled rasterization, ported from `xueweilnvidia/flashinfer` commit
+`bb1ae35f03a006be325ed861597de68c93a55b1b`. Its GEMM2 tactic may include
+`(num_c_stage, num_store_warps, swizzle_size[, use_l2_hints])` as a fourth
+element. The optional hints load A evict-first and reduce BF16 output
+evict-last in L2; they require a fused BF16 output and dedicated store warps.
+The tuner searches hints on/off and includes C2/W2/swizzle2, because the best
+cache policy and swizzle depend on the routing distribution and problem size.
+It also includes C2/W4/swizzle2 with hints, which reduces store-issue pressure
+on the large routed FC2 case; earlier candidates remain available.
+W8/W16 tactics distribute each M128 tile over 16/8 active row lanes per warp,
+so all dedicated store warps issue work. Their S2/S4 candidates remain optional:
+they improve some low-K cases, while W2/W4 often win at K768. With C2/W2,
+the store consumer prepares the next stage's row count, N coordinate and bulk
+size while the current bulk group reads shared memory. The old stage is still
+released only after `cp_async_bulk_wait_group(0, read=True)`. C1 releases its
+slot before waiting for reuse, and W4/W8/W16 retain the original read/release
+ordering because metadata lookahead did not consistently help them.
+`tests/moe/test_cute_dsl_fc2_store.py` covers routing tails,
+empty experts, non-unit alpha and graph replay with updated routing/scales.
+
 `flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
 CuTe-DSL grouped FP8 API; `group_deepgemm_fp8_nt_groupwise` keeps its original
 DeepGEMM-only signature. Both use per-row expert indices, unlike the indptr-based
