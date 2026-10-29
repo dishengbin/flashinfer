@@ -38,9 +38,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from . import sm103_mma
 from .utils import (
     blk_copy,
     blk_reduce_bf16,
+    blk_reduce_bf16_l2_hint,
     blk_reduce_fp16,
     blk_reduce_fp32,
     griddepcontrol_launch_dependents,
@@ -367,6 +369,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         enable_pdl: bool = True,
         use_a_per_token_scale: bool = False,
         use_fused_finalize: bool = True,
+        num_c_stage: int = 1,
+        num_store_warps: int = 0,
+        swizzle_size: int = 1,
+        use_l2_hints: bool = False,
+        enable_3x_mma: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -384,16 +391,62 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         :type cluster_shape_mn: Tuple[int, int]
         :param raster_along_m: Boolean, True to use raster along M.
         :type raster_along_m: bool
+        :param num_c_stage: Number of smem C tiles. More than one requires
+            num_store_warps > 0 (the store warps drain one tile while the
+            epilogue fills the next).
+        :type num_c_stage: int
+        :param num_store_warps: Number of dedicated warps issuing the per-row
+            output bulk writes. 0 keeps the writes in the epilogue warps.
+            W8/W16 spread the tile over 16/8 row lanes per warp. With W2 and
+            multiple C stages, next-stage metadata is prepared before waiting
+            for the current bulk group to finish reading shared memory.
+        :type num_store_warps: int
+        :param swizzle_size: Grouped rasterization; with raster_along_m=True,
+            swizzle_size N tiles are visited per M tile before moving to the
+            next M tile, which keeps the set of reduced output columns small
+            enough to stay in L2.
+        :type swizzle_size: int
+        :param use_l2_hints: Load A evict-first and reduce the output
+            evict-last in L2. Requires num_store_warps > 0.
+        :type use_l2_hints: bool
+        :param enable_3x_mma: Use SM103 K96 MMA over the packed K256 TMA
+            buffers. Requires block-16 FP4 inputs and logical K divisible
+            by 768. Kept opt-in because its latency depends on the pipeline.
+        :type enable_3x_mma: bool
         """
 
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
         self.use_fused_finalize = use_fused_finalize
+        self.enable_3x_mma = enable_3x_mma
+        if enable_3x_mma and mma_tiler_mn != (256, 256):
+            raise ValueError("SM103 K96 FC2 currently requires a (256, 256) MMA tile")
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
+        self.swizzle_size = swizzle_size
+        # num_store_warps > 0: dedicated warps issue the per-row bulk writes.
+        # The epilogue warps hand each filled smem C stage over through a
+        # full/empty mbarrier pipeline, so they can start the next tile while
+        # the store warps are still feeding the TMA unit.
+        assert num_c_stage == 1 or num_store_warps > 0, (
+            "num_c_stage > 1 requires num_store_warps > 0"
+        )
+        self.num_c_stage_req = num_c_stage
+        self.num_store_warps = num_store_warps
+        self.use_store_pipe = num_store_warps > 0
+        # L2 eviction hints of the store-warp epilogue: A is streamed once per
+        # swizzle group of N tiles, so it is loaded evict-first, and the
+        # reduced output rows are kept evict-last. Otherwise the A stream
+        # evicts the output columns being reduced, and their reductions
+        # round-trip through DRAM. Whether that wins depends on the shape
+        # (see BLACKWELL_GEMM2_EPILOGUE_CANDIDATES), so it is a tactic option.
+        assert not use_l2_hints or num_store_warps > 0, (
+            "use_l2_hints requires num_store_warps > 0"
+        )
+        self.use_l2_hints = use_l2_hints
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -407,6 +460,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.tma_warp_id = 5
         self.sched_warp_id = 6
         self.meta_load_warp_id = 7
+        self.store_warp_id = tuple(range(8, 8 + num_store_warps))
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
@@ -415,6 +469,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 self.tma_warp_id,
                 self.sched_warp_id,
                 self.meta_load_warp_id,
+                *self.store_warp_id,
             )
         )
         self.threads_wo_sched = self.threads_per_warp * len(
@@ -567,6 +622,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.final_scale_dtype,
             self.num_smem_capacity,
             self.occupancy,
+            num_c_stage=self.num_c_stage_req,
+            # Store-warp handoff: (valid rows, coord_n) + per-row output index
+            # for every C stage.
+            extra_smem_bytes=(
+                (self.cta_tile_shape_mnk[0] + 2) * 4 * self.num_c_stage_req
+                if self.use_store_pipe
+                else 0
+            ),
         )
 
         # Compute A/B/C/Scale shared memory layout
@@ -595,6 +658,18 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.num_ab_stage,
         )
 
+        if self.enable_3x_mma:
+            # The K96 descriptor consumes packed bytes with 128B swizzling.
+            # TMA uses a byte view; retain the FP4 view for storage accounting.
+            self.a_smem_layout_staged = cute.make_composed_layout(
+                cute.make_swizzle(3, 5, 3), 0, self.a_smem_layout_staged.outer
+            )
+            self.b_smem_layout_staged = cute.make_composed_layout(
+                cute.make_swizzle(3, 5, 3), 0, self.b_smem_layout_staged.outer
+            )
+            if self.num_ab_stage < 2:
+                raise ValueError("SM103 K96 FC2 requires at least two A/B stages")
+
         swizzled_pad = 16 // (self.out_dtype.width // 8)
         self.c_smem_layout_staged = cute.make_layout(
             (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], self.num_c_stage),
@@ -616,6 +691,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.num_sfb_tmem_cols = (
             self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn
         ) * mma_inst_tile_k
+        if self.enable_3x_mma:
+            # Two K96 MMAs share twelve scales rather than the sixteen
+            # scales used by one K256 storage tile. Recycle this SF window.
+            self.num_sfa_tmem_cols = self.num_sfa_tmem_cols * 3 // 4
+            self.num_sfb_tmem_cols = self.num_sfb_tmem_cols * 3 // 4
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage
@@ -749,38 +829,48 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            a_op,
-            a,
-            a_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=(
-                self.smem_alloc_a_dtype
-                if self.needs_unpack and self.a_dtype.width < 8
-                else None
-            ),
-        )
+        if cutlass.const_expr(self.enable_3x_mma):
+            tma_atom_a, tma_tensor_a = sm103_mma.make_tma_atom(
+                a_op, a, tiled_mma, self.cluster_shape_mn[1], "a"
+            )
+        else:
+            tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+                a_op,
+                a,
+                a_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=(
+                    self.smem_alloc_a_dtype
+                    if self.needs_unpack and self.a_dtype.width < 8
+                    else None
+                ),
+            )
 
         # Setup TMA load for B
         b_op = sm100_utils.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mn, tiled_mma.thr_id
         )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            b,
-            b_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=(
-                self.smem_alloc_b_dtype
-                if self.needs_unpack and self.b_dtype.width < 8
-                else None
-            ),
-        )
+        if cutlass.const_expr(self.enable_3x_mma):
+            tma_atom_b, tma_tensor_b = sm103_mma.make_tma_atom(
+                b_op, b, tiled_mma, self.cluster_shape_mn[0] // atom_thr_size, "b"
+            )
+        else:
+            tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op,
+                b,
+                b_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=(
+                    self.smem_alloc_b_dtype
+                    if self.needs_unpack and self.b_dtype.width < 8
+                    else None
+                ),
+            )
 
         # Setup TMA load for SFA
         sfa_op = sm100_utils.cluster_shape_to_tma_atom_A(
@@ -851,6 +941,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.cluster_shape_mn,
             max_active_clusters,
             self.raster_along_m,
+            self.swizzle_size,
         )
 
         self.buffer_align_bytes = 1024
@@ -898,6 +989,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 cutlass.Int64, self.num_tile_stage * 2
             ]
             meta_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_meta_stage * 2]
+            # C stage handoff epilogue -> store warps (num_store_warps > 0)
+            c_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_c_stage * 2]
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             # (MMA, MMA_M, MMA_K, STAGE)
@@ -948,6 +1041,23 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 cute.struct.MemRange[
                     self.final_scale_dtype,
                     self.cta_tile_shape_mnk[0] * self.num_meta_stage,
+                ],
+                1,
+            ]
+            # Per C stage, for the store warps: (valid rows, coord_n) and the
+            # output row of every tile row. Minimal size without store warps.
+            c_info: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 2 * self.num_c_stage],
+                1,
+            ]
+            c_token_idx: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Int32,
+                    (
+                        self.cta_tile_shape_mnk[0] * self.num_c_stage
+                        if self.use_store_pipe
+                        else 1
+                    ),
                 ],
                 1,
             ]
@@ -1184,6 +1294,22 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             consumer_group=meta_pipeline_consumer_group,
         )
 
+        # C stage handoff pipeline (epilogue warps -> store warps)
+        c_pipeline = None
+        if cutlass.const_expr(self.use_store_pipe):
+            c_pipeline = pipeline.PipelineAsync.create(
+                barrier_storage=storage.c_mbar_ptr.data_ptr(),
+                num_stages=self.num_c_stage,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.threads_per_warp * len(self.epilog_warp_id),
+                ),
+                consumer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.threads_per_warp * self.num_store_warps,
+                ),
+            )
+
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
@@ -1228,6 +1354,19 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         sMetaTokenIdx = storage.meta_token_idx.get_tensor(meta_layout)
         sMetaScale = storage.meta_scale.get_tensor(meta_layout)
 
+        # Store-warp handoff info: (valid rows, coord_n) and output rows per C stage
+        sCInfo = storage.c_info.get_tensor(
+            cute.make_layout((2, self.num_c_stage), stride=(1, 2))
+        )
+        sCTokenIdx = None
+        if cutlass.const_expr(self.use_store_pipe):
+            sCTokenIdx = storage.c_token_idx.get_tensor(
+                cute.make_layout(
+                    (self.cta_tile_shape_mnk[0], self.num_c_stage),
+                    stride=(1, self.cta_tile_shape_mnk[0]),
+                )
+            )
+
         #
         # Compute multicast mask for A/B buffer full
         #
@@ -1252,13 +1391,18 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         #
         # Local_tile partition global tensors
         #
+        # The SM103 TMA tensors address packed bytes; SF tensors retain
+        # their original logical FP4 K dimension.
+        ab_tiler = self.mma_tiler
+        if cutlass.const_expr(self.enable_3x_mma):
+            ab_tiler = (*self.mma_tiler[:2], self.mma_tiler[2] // 2)
         # (bM, bK, loopM, loopK, loopL)
         gA_mkl = cute.local_tile(
-            mA_mkl, cute.slice_(self.mma_tiler, (None, 0, None)), (None, None, None)
+            mA_mkl, cute.slice_(ab_tiler, (None, 0, None)), (None, None, None)
         )
         # (bN, bK, loopN, loopK, loopL)
         gB_nkl = cute.local_tile(
-            mB_nkl, cute.slice_(self.mma_tiler, (0, None, None)), (None, None, None)
+            mB_nkl, cute.slice_(ab_tiler, (0, None, None)), (None, None, None)
         )
 
         # (bM, bK, RestM, RestK, RestL)
@@ -1292,6 +1436,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         #
         # Partition global/shared tensor for TMA load A/B
         #
+        ab_sA, ab_sB = sA, sB
+        if cutlass.const_expr(self.enable_3x_mma):
+            ab_sA = sm103_mma.packed_smem_view(sA, self.num_ab_stage)
+            ab_sB = sm103_mma.packed_smem_view(sB, self.num_ab_stage)
+
         # TMA load A partition_S/D
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -1302,7 +1451,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tma_atom_a,
             block_in_cluster_coord_vmnk[2],
             a_cta_layout,
-            cute.group_modes(sA, 0, 3),
+            cute.group_modes(ab_sA, 0, 3),
             cute.group_modes(tCgA, 0, 3),
         )
         # TMA load B partition_S/D
@@ -1315,7 +1464,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tma_atom_b,
             block_in_cluster_coord_vmnk[1],
             b_cta_layout,
-            cute.group_modes(sB, 0, 3),
+            cute.group_modes(ab_sB, 0, 3),
             cute.group_modes(tCgB, 0, 3),
         )
 
@@ -1355,9 +1504,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Partition shared/tensor memory tensor for TiledMMA_A/B/C
         #
         # (MMA, MMA_M, MMA_K, STAGE)
-        tCrA = tiled_mma.make_fragment_A(sA)
-        # (MMA, MMA_N, MMA_K, STAGE)
-        tCrB = tiled_mma.make_fragment_B(sB)
+        tCrA, tCrB = None, None
+        if cutlass.const_expr(not self.enable_3x_mma):
+            tCrA = tiled_mma.make_fragment_A(sA)
+            tCrB = tiled_mma.make_fragment_B(sB)
         # (MMA, MMA_M, MMA_N)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
@@ -1571,6 +1721,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.tma_warp_id:
+            a_l2_policy = None
+            if cutlass.const_expr(self.use_l2_hints):
+                a_l2_policy = cute.arch.inline_ptx(
+                    "createpolicy.fractional.L2::evict_first.b64 $0, 1.0;",
+                    write_only_types=[cutlass.Int64],
+                    read_only_args=[],
+                )
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_ab_stage
             )
@@ -1654,6 +1811,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tAsA_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=a_full_mcast_mask,
+                        cache_policy=a_l2_policy,
                     )
                     cute.copy(
                         tma_atom_b,
@@ -1764,6 +1922,28 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 tCtSFB_compact_s2t,
             ) = self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB)
 
+            if cutlass.const_expr(self.enable_3x_mma):
+                native_mma = sm100_utils.sm103_make_blockscaled_trivial_tiled_mma(
+                    self.sf_dtype,
+                    self.sf_vec_size,
+                    self.cta_group,
+                    self.mma_inst_shape_mn,
+                )
+                tCtSFA_native = sm103_mma.sf_mma_view(
+                    native_mma,
+                    sfa_tmem_ptr,
+                    self.mma_tiler,
+                    self.cta_tile_shape_mnk[0],
+                    False,
+                )
+                tCtSFB_native = sm103_mma.sf_mma_view(
+                    native_mma,
+                    sfb_tmem_ptr,
+                    self.mma_tiler,
+                    self.cta_tile_shape_mnk_sfb[1],
+                    True,
+                )
+
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
             )
@@ -1854,78 +2034,105 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 # Mma mainloop
                 #
-                for k_tile in cutlass.range(k_tile_cnt):  # noqa: B007
+                if cutlass.const_expr(self.enable_3x_mma):
                     if is_leader_cta:
-                        # Conditionally wait for AB buffer full
-                        ab_pipeline.consumer_wait(
-                            ab_consumer_state, peek_ab_full_status
-                        )
-
-                        #  Copy SFA/SFB from smem to tmem
-                        s2t_stage_coord = (
-                            None,
-                            None,
-                            None,
-                            None,
-                            ab_consumer_state.index,
-                        )
-                        tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
-                        tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
-                        cute.copy(
+                        ab_consumer_state = sm103_mma.mainloop(
+                            native_mma,
+                            tCtAcc,
+                            ab_sA,
+                            ab_sB,
                             tiled_copy_s2t_sfa,
-                            tCsSFA_compact_s2t_staged,
+                            tCsSFA_compact_s2t,
                             tCtSFA_compact_s2t,
-                        )
-                        cute.copy(
                             tiled_copy_s2t_sfb,
-                            tCsSFB_compact_s2t_staged,
+                            tCsSFB_compact_s2t,
                             tCtSFB_compact_s2t,
+                            tCtSFA_native,
+                            tCtSFB_native,
+                            ab_pipeline,
+                            ab_consumer_state,
+                            peek_ab_full_status,
+                            k_tile_cnt,
                         )
+                else:
+                    for k_tile in cutlass.range(k_tile_cnt):  # noqa: B007
+                        if is_leader_cta:
+                            # Conditionally wait for AB buffer full
+                            ab_pipeline.consumer_wait(
+                                ab_consumer_state, peek_ab_full_status
+                            )
 
-                        # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
-                        num_kblocks = cute.size(tCrA, mode=[2])
-
-                        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                            kblock_coord = (
+                            #  Copy SFA/SFB from smem to tmem
+                            s2t_stage_coord = (
                                 None,
                                 None,
-                                kblock_idx,
+                                None,
+                                None,
                                 ab_consumer_state.index,
                             )
-
-                            # Set SFA/SFB tensor to tiled_mma
-                            sf_kblock_coord = (None, None, kblock_idx)
-                            tiled_mma.set(
-                                tcgen05.Field.SFA,
-                                tCtSFA[sf_kblock_coord].iterator,
+                            tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[
+                                s2t_stage_coord
+                            ]
+                            tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[
+                                s2t_stage_coord
+                            ]
+                            cute.copy(
+                                tiled_copy_s2t_sfa,
+                                tCsSFA_compact_s2t_staged,
+                                tCtSFA_compact_s2t,
                             )
-                            tiled_mma.set(
-                                tcgen05.Field.SFB,
-                                tCtSFB_mma[sf_kblock_coord].iterator,
-                            )
-
-                            cute.gemm(
-                                tiled_mma,
-                                tCtAcc,
-                                tCrA[kblock_coord],
-                                tCrB[kblock_coord],
-                                tCtAcc,
+                            cute.copy(
+                                tiled_copy_s2t_sfb,
+                                tCsSFB_compact_s2t_staged,
+                                tCtSFB_compact_s2t,
                             )
 
-                            # Enable accumulate on tCtAcc after first kblock
-                            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                            # tCtAcc += tCrA * tCrSFA * tCrB * tCrSFB
+                            num_kblocks = cute.size(tCrA, mode=[2])
 
-                        # Async arrive AB buffer empty
-                        ab_pipeline.consumer_release(ab_consumer_state)
+                            for kblock_idx in cutlass.range(
+                                num_kblocks, unroll_full=True
+                            ):
+                                kblock_coord = (
+                                    None,
+                                    None,
+                                    kblock_idx,
+                                    ab_consumer_state.index,
+                                )
 
-                    # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
-                    ab_consumer_state.advance()
-                    peek_ab_full_status = cutlass.Boolean(1)
-                    if ab_consumer_state.count < k_tile_cnt:
-                        if is_leader_cta:
-                            peek_ab_full_status = ab_pipeline.consumer_try_wait(
-                                ab_consumer_state
-                            )
+                                # Set SFA/SFB tensor to tiled_mma
+                                sf_kblock_coord = (None, None, kblock_idx)
+                                tiled_mma.set(
+                                    tcgen05.Field.SFA,
+                                    tCtSFA[sf_kblock_coord].iterator,
+                                )
+                                tiled_mma.set(
+                                    tcgen05.Field.SFB,
+                                    tCtSFB_mma[sf_kblock_coord].iterator,
+                                )
+
+                                cute.gemm(
+                                    tiled_mma,
+                                    tCtAcc,
+                                    tCrA[kblock_coord],
+                                    tCrB[kblock_coord],
+                                    tCtAcc,
+                                )
+
+                                # Enable accumulate on tCtAcc after first kblock
+                                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+
+                            # Async arrive AB buffer empty
+                            ab_pipeline.consumer_release(ab_consumer_state)
+
+                        # Peek (try_wait) AB buffer full for k_tile = k_tile + 1
+                        ab_consumer_state.advance()
+                        peek_ab_full_status = cutlass.Boolean(1)
+                        if ab_consumer_state.count < k_tile_cnt:
+                            if is_leader_cta:
+                                peek_ab_full_status = ab_pipeline.consumer_try_wait(
+                                    ab_consumer_state
+                                )
 
                 #
                 # Async arrive accumulator buffer full(each kblock)
@@ -2093,6 +2300,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            # Store-warp handoff state; defined unconditionally so the dynamic
+            # while loop carries it.
+            c_stage = cutlass.Int32(0)
+            c_producer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, self.num_c_stage
+            )
+
             while is_valid_tile:
                 tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                 permuted_row = tile_m_start + epi_tidx
@@ -2133,6 +2347,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 #
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
+                if cutlass.const_expr(self.use_store_pipe):
+                    # Wait until the store warps have drained this C stage.
+                    c_pipeline.producer_acquire(c_producer_state)
+                    c_stage = c_producer_state.index
+
                 for subtile_idx in cutlass.range(subtile_cnt):
                     real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
@@ -2161,11 +2380,20 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                     tRS_rC.store(acc_vec_final.to(self.out_dtype))
                     if is_valid_row:
-                        cute.copy(
-                            tiled_copy_r2s,
-                            tRS_rC,
-                            tRS_sC[(None, None, real_subtile_idx, None)],
-                        )
+                        if cutlass.const_expr(self.use_store_pipe):
+                            # Index the C stage explicitly; drop the matching
+                            # size-1 trailing mode of the register fragment.
+                            cute.copy(
+                                tiled_copy_r2s,
+                                tRS_rC[(None, None, 0)],
+                                tRS_sC[(None, None, real_subtile_idx, c_stage)],
+                            )
+                        else:
+                            cute.copy(
+                                tiled_copy_r2s,
+                                tRS_rC,
+                                tRS_sC[(None, None, real_subtile_idx, None)],
+                            )
 
                 # Make all R2S smem writes visible to the async bulk-reduce proxy.
                 cute.arch.fence_proxy(
@@ -2183,64 +2411,78 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
-                if is_partial_tile:
+                if cutlass.const_expr(self.use_store_pipe):
+                    # Hand the filled C stage to the store warps.
+                    sCTokenIdx[(epi_tidx, c_stage)] = token_idx
+                    if epi_tidx == 0:
+                        # With 2-CTA MMA the peer CTA's half of a tile can hold
+                        # no valid row (negative count); clamp so it is not
+                        # mistaken for the end-of-work marker (-1).
+                        sCInfo[(0, c_stage)] = cutlass.max(
+                            tile_info[4] - tile_m_start, cutlass.Int32(0)
+                        )
+                        sCInfo[(1, c_stage)] = tile_info[1] * self.cta_tile_shape_mnk[1]
+                    c_pipeline.producer_commit(c_producer_state)
+                    c_producer_state.advance()
+                else:
+                    if is_partial_tile:
+                        self.epilog_sync_barrier.arrive_and_wait()
+
+                    # Write expanded rows directly or atomically reduce into token rows.
+                    reduce_row = epi_tidx
+                    if is_partial_tile:
+                        reduce_row = (epi_tidx % self.threads_per_warp) * len(
+                            self.epilog_warp_id
+                        ) + (epi_tidx // self.threads_per_warp)
+                    reduce_permuted_row = tile_m_start + reduce_row
+                    is_valid_reduce_row = reduce_permuted_row < tile_info[4]
+                    if is_valid_reduce_row:
+                        coord_n = tile_info[1] * self.cta_tile_shape_mnk[1]
+                        valid_columns = cutlass.min(
+                            cutlass.Int64(out.shape[1]) - coord_n,
+                            cutlass.Int64(self.cta_tile_shape_mnk[1]),
+                        )
+                        if valid_columns > 0:
+                            reduce_token_idx = sMetaTokenIdx[
+                                (reduce_row, meta_consumer_state.index)
+                            ]
+                            scatter_out_offset = cute.domain_offset(
+                                (reduce_token_idx, coord_n, 0), out
+                            )
+                            valid_copy_size = cutlass.Int32(
+                                valid_columns * (self.out_dtype.width // 8)
+                            )
+                            # is_valid_tensor_alignment requires each output row to
+                            # end on a 16-byte boundary, matching the bulk-copy
+                            # instruction's size and address requirements.
+                            if cutlass.const_expr(not self.use_fused_finalize):
+                                blk_copy(
+                                    scatter_out_offset,
+                                    sC[reduce_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(
+                                    scatter_out_offset,
+                                    sC[reduce_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
+                                blk_reduce_fp32(
+                                    scatter_out_offset,
+                                    sC[reduce_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
+                                blk_reduce_fp16(
+                                    scatter_out_offset,
+                                    sC[reduce_row, None, 0],
+                                    valid_copy_size,
+                                )
+
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
                     self.epilog_sync_barrier.arrive_and_wait()
-
-                # Write expanded rows directly or atomically reduce into token rows.
-                reduce_row = epi_tidx
-                if is_partial_tile:
-                    reduce_row = (epi_tidx % self.threads_per_warp) * len(
-                        self.epilog_warp_id
-                    ) + (epi_tidx // self.threads_per_warp)
-                reduce_permuted_row = tile_m_start + reduce_row
-                is_valid_reduce_row = reduce_permuted_row < tile_info[4]
-                if is_valid_reduce_row:
-                    coord_n = tile_info[1] * self.cta_tile_shape_mnk[1]
-                    valid_columns = cutlass.min(
-                        cutlass.Int64(out.shape[1]) - coord_n,
-                        cutlass.Int64(self.cta_tile_shape_mnk[1]),
-                    )
-                    if valid_columns > 0:
-                        reduce_token_idx = sMetaTokenIdx[
-                            (reduce_row, meta_consumer_state.index)
-                        ]
-                        scatter_out_offset = cute.domain_offset(
-                            (reduce_token_idx, coord_n, 0), out
-                        )
-                        valid_copy_size = cutlass.Int32(
-                            valid_columns * (self.out_dtype.width // 8)
-                        )
-                        # is_valid_tensor_alignment requires each output row to
-                        # end on a 16-byte boundary, matching the bulk-copy
-                        # instruction's size and address requirements.
-                        if cutlass.const_expr(not self.use_fused_finalize):
-                            blk_copy(
-                                scatter_out_offset,
-                                sC[reduce_row, None, 0],
-                                valid_copy_size,
-                            )
-                        elif cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
-                            blk_reduce_bf16(
-                                scatter_out_offset,
-                                sC[reduce_row, None, 0],
-                                valid_copy_size,
-                            )
-                        elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
-                            blk_reduce_fp32(
-                                scatter_out_offset,
-                                sC[reduce_row, None, 0],
-                                valid_copy_size,
-                            )
-                        elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
-                            blk_reduce_fp16(
-                                scatter_out_offset,
-                                sC[reduce_row, None, 0],
-                                valid_copy_size,
-                            )
-
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
-                self.epilog_sync_barrier.arrive_and_wait()
 
                 # Release the prefetched metadata slot for this tile.
                 meta_pipeline.consumer_release(meta_consumer_state)
@@ -2261,12 +2503,144 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+            if cutlass.const_expr(self.use_store_pipe):
+                # Tell the store warps there are no more tiles (valid rows = -1).
+                c_pipeline.producer_acquire(c_producer_state)
+                if epi_tidx == 0:
+                    sCInfo[(0, c_producer_state.index)] = cutlass.Int32(-1)
+                c_pipeline.producer_commit(c_producer_state)
             #
             # Dealloc the tensor memory buffer
             #
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
+
+        #
+        # Specialized store warps: one bulk write per C row, per handed-over stage
+        #
+        if cutlass.const_expr(self.use_store_pipe):
+            if warp_idx >= self.store_warp_id[0]:
+                st_tidx = tidx - self.threads_per_warp * self.store_warp_id[0]
+                row_start = st_tidx
+                row_step = self.threads_per_warp * self.num_store_warps
+                lanes_per_warp = self.threads_per_warp
+                if cutlass.const_expr(self.num_store_warps > 4):
+                    # Give every W8/W16 store warp 16/8 row lanes instead of
+                    # leaving warps after the first four without rows.
+                    lanes_per_warp = cute.ceil_div(
+                        self.cta_tile_shape_mnk[0], self.num_store_warps
+                    )
+                    row_start = (
+                        st_tidx // self.threads_per_warp
+                    ) * lanes_per_warp + st_tidx % self.threads_per_warp
+                    row_step = self.num_store_warps * lanes_per_warp
+                out_l2_policy = None
+                if cutlass.const_expr(self.use_l2_hints):
+                    out_l2_policy = cute.arch.inline_ptx(
+                        "createpolicy.fractional.L2::evict_last.b64 $0, 1.0;",
+                        write_only_types=[cutlass.Int64],
+                        read_only_args=[],
+                    )
+                c_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_c_stage
+                )
+                if cutlass.const_expr(
+                    self.num_c_stage > 1 and self.num_store_warps == 2
+                ):
+                    c_release_state = c_consumer_state.clone()
+                c_pipeline.consumer_wait(c_consumer_state)
+                valid_rows = sCInfo[(0, c_consumer_state.index)]
+                if cutlass.const_expr(
+                    self.num_c_stage > 1 and self.num_store_warps == 2
+                ):
+                    prefetched_coord_n = cutlass.Int32(0)
+                    prefetched_valid_columns = cutlass.Int64(0)
+                    prefetched_copy_size = cutlass.Int32(0)
+                    if valid_rows >= 0:
+                        prefetched_coord_n = sCInfo[(1, c_consumer_state.index)]
+                        prefetched_valid_columns = cutlass.min(
+                            cutlass.Int64(out.shape[1]) - prefetched_coord_n,
+                            cutlass.Int64(self.cta_tile_shape_mnk[1]),
+                        )
+                        prefetched_copy_size = cutlass.Int32(
+                            prefetched_valid_columns * (self.out_dtype.width // 8)
+                        )
+                while valid_rows >= 0:
+                    st_stage = c_consumer_state.index
+                    if cutlass.const_expr(
+                        self.num_c_stage > 1 and self.num_store_warps == 2
+                    ):
+                        st_coord_n = prefetched_coord_n
+                        st_valid_columns = prefetched_valid_columns
+                        st_copy_size = prefetched_copy_size
+                    else:
+                        st_coord_n = sCInfo[(1, st_stage)]
+                        st_valid_columns = cutlass.min(
+                            cutlass.Int64(out.shape[1]) - st_coord_n,
+                            cutlass.Int64(self.cta_tile_shape_mnk[1]),
+                        )
+                        st_copy_size = cutlass.Int32(
+                            st_valid_columns * (self.out_dtype.width // 8)
+                        )
+                    # A swizzled raster rounds the N tile count up to a multiple
+                    # of swizzle_size; the padded tiles lie past the output.
+                    for r in cutlass.range(
+                        row_start, self.cta_tile_shape_mnk[0], row_step
+                    ):
+                        if (
+                            st_tidx % self.threads_per_warp < lanes_per_warp
+                            and r < valid_rows
+                            and st_valid_columns > 0
+                        ):
+                            st_dst = cute.domain_offset(
+                                (sCTokenIdx[(r, st_stage)], st_coord_n, 0), out
+                            )
+                            st_src = sC[r, None, st_stage]
+                            if cutlass.const_expr(not self.use_fused_finalize):
+                                blk_copy(st_dst, st_src, st_copy_size)
+                            elif cutlass.const_expr(
+                                self.out_dtype == cutlass.BFloat16 and self.use_l2_hints
+                            ):
+                                blk_reduce_bf16_l2_hint(
+                                    st_dst, st_src, st_copy_size, out_l2_policy
+                                )
+                            elif cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(st_dst, st_src, st_copy_size)
+                            elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
+                                blk_reduce_fp32(st_dst, st_src, st_copy_size)
+                            elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
+                                blk_reduce_fp16(st_dst, st_src, st_copy_size)
+                    cute.arch.cp_async_bulk_commit_group()
+                    if cutlass.const_expr(
+                        self.num_c_stage > 1 and self.num_store_warps == 2
+                    ):
+                        # The next slot is independent of the SMEM source still
+                        # being read. Prepare it while the current group drains.
+                        c_consumer_state.advance()
+                        c_pipeline.consumer_wait(c_consumer_state)
+                        valid_rows = sCInfo[(0, c_consumer_state.index)]
+                        if valid_rows >= 0:
+                            prefetched_coord_n = sCInfo[(1, c_consumer_state.index)]
+                            prefetched_valid_columns = cutlass.min(
+                                cutlass.Int64(out.shape[1]) - prefetched_coord_n,
+                                cutlass.Int64(self.cta_tile_shape_mnk[1]),
+                            )
+                            prefetched_copy_size = cutlass.Int32(
+                                prefetched_valid_columns * (self.out_dtype.width // 8)
+                            )
+                        # Release only the old slot, after all source reads.
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        c_pipeline.consumer_release(c_release_state)
+                        c_release_state.advance()
+                    else:
+                        # Keep the original loop for C1 and other warp counts.
+                        # C1 must release before waiting for its next use.
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        c_pipeline.consumer_release(c_consumer_state)
+                        c_consumer_state.advance()
+                        c_pipeline.consumer_wait(c_consumer_state)
+                        valid_rows = sCInfo[(0, c_consumer_state.index)]
 
         griddepcontrol_launch_dependents()
 
@@ -2372,6 +2746,8 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         final_scale_dtype: Type[cutlass.Numeric],
         num_smem_capacity: int,
         occupancy: int,
+        num_c_stage: int = 1,
+        extra_smem_bytes: int = 0,
     ) -> Tuple[int, int, int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -2402,9 +2778,6 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         """
         # Default ACC stages
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
-
-        # Default C stages
-        num_c_stage = 1
 
         # Default Tile info stages
         num_tile_stage = 2
@@ -2471,7 +2844,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Divide remaining by bytes needed per A/B stage
         num_ab_stage = (
             num_smem_capacity // occupancy
-            - (mbar_helpers_bytes + c_bytes + meta_smem_bytes)
+            - (mbar_helpers_bytes + c_bytes + meta_smem_bytes + extra_smem_bytes)
         ) // ab_bytes_per_stage
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage, num_meta_stage  # type: ignore[return-value]
@@ -2483,6 +2856,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cluster_shape_mn: Tuple[int, int],
         max_active_clusters: cutlass.Constexpr,
         raster_along_m: bool,
+        swizzle_size: int = 1,
     ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
         """Use persistent tile scheduler to compute the grid size based on GEMM shape.
 
@@ -2512,7 +2886,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cluster_shape_mnl = (*cluster_shape_mn, 1)
 
         tile_sched_params = utils.PersistentTileSchedulerParams(
-            num_ctas_mnl, cluster_shape_mnl, raster_along_m=raster_along_m
+            num_ctas_mnl,
+            cluster_shape_mnl,
+            swizzle_size=swizzle_size,
+            raster_along_m=raster_along_m,
         )
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters

@@ -223,6 +223,12 @@ def _get_compiled_finalize_kernel(
     enable_pdl: bool = True,
     use_a_per_token_scale: bool = False,
     use_fused_finalize: bool = True,
+    # Blackwell store-warp epilogue
+    num_c_stage: int = 1,
+    num_store_warps: int = 0,
+    swizzle_size: int = 1,
+    use_l2_hints: bool = False,
+    enable_3x_mma: bool = False,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -260,10 +266,23 @@ def _get_compiled_finalize_kernel(
         enable_pdl,
         use_a_per_token_scale,
         use_fused_finalize,
+        num_c_stage,
+        num_store_warps,
+        swizzle_size,
+        use_l2_hints,
+        enable_3x_mma,
     )
 
     if cache_key not in _finalize_kernel_cache:
         if is_rubin:
+            if (num_c_stage, num_store_warps, swizzle_size) != (1, 0, 1) or (
+                use_l2_hints
+            ):
+                raise NotImplementedError(
+                    "num_c_stage / num_store_warps / swizzle_size / use_l2_hints "
+                    "are only supported by the Blackwell finalize grouped GEMM "
+                    "kernel."
+                )
             if use_a_per_token_scale:
                 raise NotImplementedError(
                     "use_a_per_token_scale (per-token activation scale) is "
@@ -299,6 +318,11 @@ def _get_compiled_finalize_kernel(
                 enable_pdl=enable_pdl,
                 use_a_per_token_scale=use_a_per_token_scale,
                 use_fused_finalize=use_fused_finalize,
+                num_c_stage=num_c_stage,
+                num_store_warps=num_store_warps,
+                swizzle_size=swizzle_size,
+                use_l2_hints=use_l2_hints,
+                enable_3x_mma=enable_3x_mma,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -376,6 +400,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    num_c_stage: int = 1,
+    num_store_warps: int = 0,
+    swizzle_size: int = 1,
+    use_l2_hints: bool = False,
+    enable_3x_mma: bool = False,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -416,6 +445,16 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
              a caller-provided output with twice the shard's output width.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
+        num_c_stage: Number of shared-memory output stages on Blackwell.
+             Multiple stages require dedicated store warps. Default: 1.
+        num_store_warps: Dedicated warps issuing output writes. Default: 0.
+        swizzle_size: Grouped tile rasterization factor on Blackwell. Default: 1.
+        use_l2_hints: Load A evict-first and reduce output evict-last in L2.
+             Requires fused BF16 output and dedicated store warps on Blackwell.
+             Default: False; the best cache policy depends on the workload.
+        enable_3x_mma: Opt in to SM103 K96 NVFP4 MMA. Requires block-16
+             scales, a (256, 256) tile, and K divisible by 768. Keeps the
+             existing packed operands and SF layouts. Default: False.
 
     Returns:
         out: Output tensor with dtype out_dtype. The shape is ``(seq_len, n)``
@@ -511,6 +550,24 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"mma_tiler/mma_inst_shape select the Rubin (SM107) finalize "
             f"kernel, but the device is SM{major}{minor}."
         )
+    if enable_3x_mma:
+        if (major, minor) != (10, 3):
+            raise ValueError("enable_3x_mma requires an SM103 GPU")
+        if not (
+            a_dtype == b_dtype == "float4_e2m1fn"
+            and sf_vec_size == 16
+            and mma_tiler_mn == (256, 256)
+            and k % 768 == 0
+            and not is_rubin
+        ):
+            raise ValueError(
+                "SM103 K96 FC2 requires FP4 A/B, block-16 scales, "
+                "a (256, 256) MMA tile, and K divisible by 768"
+            )
+        import cutlass.utils.blackwell_helpers as blackwell_helpers
+
+        if not hasattr(blackwell_helpers, "sm103_make_blockscaled_trivial_tiled_mma"):
+            raise NotImplementedError("SM103 K96 FC2 requires CuTe DSL K96 support")
 
     # Validate configuration
     a_dtype_cutlass = get_cutlass_dtype(a_dtype)
@@ -571,6 +628,15 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             f"final_scale_dtype={token_final_scales.dtype}, "
             f"mma_tiler_mn={mma_tiler_mn}, mma_tiler={mma_tiler}, mma_inst_shape={mma_inst_shape}, "
             f"cluster_shape_mn={cluster_shape_mn}, shape=({permuted_m}, {n}, {k}, {num_experts})"
+        )
+    # The evict-last output policy is only wired into the fused BF16 reduce;
+    # A evict-first alone would just drop A from L2.
+    if use_l2_hints and not (
+        use_fused_finalize and out_dtype_cutlass == cutlass.BFloat16
+    ):
+        raise ValueError(
+            "use_l2_hints requires use_fused_finalize and a bfloat16 output, got "
+            f"use_fused_finalize={use_fused_finalize}, out_dtype={out_dtype}"
         )
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
@@ -727,6 +793,11 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
         use_a_per_token_scale=use_a_per_token_scale,
+        num_c_stage=num_c_stage,
+        num_store_warps=num_store_warps,
+        swizzle_size=swizzle_size,
+        use_l2_hints=use_l2_hints,
+        enable_3x_mma=enable_3x_mma,
     )
 
     # Execute kernel with runtime parameters.
@@ -791,6 +862,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     sm_count: Optional[int] = None,
     enable_pdl: bool = True,
     use_fused_finalize: bool = True,
+    enable_3x_mma: bool = False,
 ) -> torch.Tensor:
     """Run the existing homogeneous NVFP4 GEMM2 finalize kernel."""
     warnings.warn(
@@ -826,6 +898,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
         sm_count=sm_count,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
+        enable_3x_mma=enable_3x_mma,
     )
 
 
