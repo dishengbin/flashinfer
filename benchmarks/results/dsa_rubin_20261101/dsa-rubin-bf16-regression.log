@@ -1,0 +1,7 @@
+/tmp/dsa-rubin-source/tests/attention/test_attention_ts_sparse_mla.py:1342: ExperimentalWarning: 'BatchSparseMLADecodePagedTSWrapper.__init__' is an experimental FlashInfer API: it provides no compatibility guarantees and may change or be removed without deprecation.
+  w = BatchSparseMLADecodePagedTSWrapper()
+2026-11-01 10:59:59,163 - INFO - cute_dsl_core.py:194 - flashinfer.jit: Compiling CuTe-DSL kernel prims_ts_mla_decode_sm107a_cute_dsl/main_sm107_8805888fc240531a4a82d13c1691ab2373c2e0d552a7e6353c93d066f0800adf
+2026-11-01 11:00:33,137 - INFO - cute_dsl_core.py:285 - flashinfer.jit: Persisted CuTe-DSL kernel to /tmp/dsa-rubin-final-check-cache/.cache/flashinfer/0.0.0+unknown/107a/cached_ops/prims_ts_mla_decode_sm107a_cute_dsl/main_sm107_8805888fc240531a4a82d13c1691ab2373c2e0d552a7e6353c93d066f0800adf.o
+/tmp/dsa-rubin-source/tests/attention/test_attention_ts_sparse_mla.py:1359: ExperimentalWarning: 'BatchSparseMLADecodePagedTSWrapper.run' is an experimental FlashInfer API: it provides no compatibility guarantees and may change or be removed without deprecation.
+  w.run(q, cache, indices, lengths, out=out, lse=lse, validate=False)
+BF16 D576 regression passed: H64, 160 rows, top-k 513, holes/ragged lengths/graph replay

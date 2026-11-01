@@ -350,6 +350,14 @@ prefix policy without adding a device readback just for dispatch.
 
 ## Benchmarking
 
+For D576 DSA attention on Rubin, use `benchmarks/bench_dsa_rubin.py`; cases are
+`B,Sq,H`, with native FP8 or `--cache-format nvfp4.fp8rope`. The default timer
+uses CUPTI, CUDA graphs and explicit L2 flushing. `--blackwell-policy` provides
+the scheduling baseline. Sparse-pool allocation-based buffer rotation alone
+does not guarantee a cold sparse working set. The opt-in `--fp8-mma-k 64`
+experiment requires full-datapath MMA; half-datapath and WS schedules retain
+K32. Correctness and graph tests are in `tests/attention/test_rubin_sparse_mla.py`.
+
 For SM90 NVFP4 fused/split and MXFP4 fused MegaMoE, use
 [`benchmarks/bench_megamoe_fp4_sm90.py`](benchmarks/bench_megamoe_fp4_sm90.py) for timing
 and [`tests/moe/test_megamoe_fp4_sm90.py`](tests/moe/test_megamoe_fp4_sm90.py) for correctness checks.

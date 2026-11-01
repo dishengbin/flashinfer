@@ -63,6 +63,7 @@ from .decode import (
 
 from .kernels.mla_decode.sparse_policy import (
     prefer_sparse_d576_reload,
+    refine_sparse_mla_rubin_profile,
     select_sparse_mla_profile,
 )
 
@@ -2387,8 +2388,8 @@ def _resolve_sparse_mla_plan(
     if not isinstance(assume_valid_prefix, bool):
         raise TypeError("assume_valid_prefix must be bool")
     device, _ = _resolve_cuda_device(device)
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
-        raise NotImplementedError("sparse TS MLA requires SM100 or SM103")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3), (10, 7)):
+        raise NotImplementedError("sparse TS MLA requires SM100, SM103 or SM107")
     for name, value in (
         ("batch_size", batch_size),
         ("num_qo_heads", num_qo_heads),
@@ -2446,6 +2447,18 @@ def _resolve_sparse_mla_plan(
         rope_dim=qk_rope_head_dim,
         kv_cache_format=kv_cache_format,
     )
+    if (
+        torch.cuda.get_device_capability(device) == (10, 7)
+        and qk_rope_head_dim == 64
+        and kv_cache_format == "native"
+        and q_dtype == torch.float8_e4m3fn
+        and not max_extra_topk
+        and not use_attention_sinks
+        and not assume_valid_prefix
+    ):
+        profile = refine_sparse_mla_rubin_profile(
+            profile, rows=max_rows, capacity=capacity, sm_count=sm_count
+        )
     # Reloading V from L2 shortens native FP8 decode's producer lifetime.
     # Sustained grids amortize the retained-KV/CLC pipeline instead; packed
     # caches and two-source/sink plans retain their format-specific schedules.
@@ -2631,6 +2644,7 @@ def resolve_sparse_d576_reload_plan(
     from .kernels.mla_decode.sparse_policy import (
         SparseMlaProfile,
         select_sparse_mla_d576_split,
+        select_sparse_mla_rubin_split,
     )
     from .kernels.mla_decode.throughput_latency_1cta.config import MlaProfile
     from .kernels.mla_decode.throughput_latency_1cta.kernel import (
@@ -2654,7 +2668,12 @@ def resolve_sparse_d576_reload_plan(
             "D576 sparse MLA supports at most 65535 query tokens per plan "
             f"(batch_size * max_q_len), got {max_rows}"
         )
-    split_kv, head_dim_ctas = select_sparse_mla_d576_split(
+    select_split = (
+        select_sparse_mla_rubin_split
+        if torch.cuda.get_device_capability(device) == (10, 7)
+        else select_sparse_mla_d576_split
+    )
+    split_kv, head_dim_ctas = select_split(
         max_rows * (num_heads // 64),
         max_topk,
         torch.cuda.get_device_properties(device).multi_processor_count,

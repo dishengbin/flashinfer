@@ -187,6 +187,9 @@ class MlaConfig(Nvfp4KVConfig):
     ws_qk: bool = False
     # Use M64 tcgen05.mma.ws for PV; P is staged in SMEM, O follows Layout E.
     ws_pv: bool = False
+    # Rubin dense FP8 K64 consumes twice the K extent of a Blackwell MMA.
+    # Kept explicit in the compile signature for controlled K32/K64 comparisons.
+    fp8_mma_k: int = 32
     kv_cache_format: str = "native"
     extra_kv_cache_format: str = "native"
     sparse_reuse_kv: bool = False

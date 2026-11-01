@@ -1,0 +1,127 @@
+{
+  "commit": "64c816a749996c80ceff3cf6d92e3670890e8b4d",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA Graphics Device', major=10, minor=7, total_memory=285227MB, multi_processor_count=212, uuid=cb1efba9-673a-5464-bd4b-419902f6aa1d, pci_bus_id=225, pci_device_id=0, pci_domain_id=10, L2_cache_size=126MB)",
+  "torch": "2.11.0+cu130",
+  "cuda": "13.0",
+  "cutlass": "4.8.1",
+  "timer": "CUPTI, CUDA graph, explicit cold L2",
+  "pool": 131072,
+  "cache_format": "native",
+  "topk": 2048,
+  "fp8_mma_k": 32,
+  "split_kv_override": 16,
+  "forced_family": null,
+  "gather_warps": 4,
+  "v_split_override": 4,
+  "reuse_kv_override": null,
+  "results": [
+    {
+      "case": "1,1,64",
+      "arm": "k32",
+      "median_us": 7.744,
+      "min_us": 7.52,
+      "max_us": 8.801,
+      "samples_ms": [
+        0.008801,
+        0.007808,
+        0.007776,
+        0.00784,
+        0.007552,
+        0.007776,
+        0.007649,
+        0.007584,
+        0.00752,
+        0.007744,
+        0.007744,
+        0.007616,
+        0.007712,
+        0.007776,
+        0.007584,
+        0.007745,
+        0.007584,
+        0.007776,
+        0.007936,
+        0.00768,
+        0.007809,
+        0.007968,
+        0.007744,
+        0.007584,
+        0.00752,
+        0.00768,
+        0.007616,
+        0.00784,
+        0.007776,
+        0.007841
+      ],
+      "workspace_bytes": 1052928,
+      "setup_seconds": 32.04791054001544,
+      "correctness": {
+        "max_abs_error": 0.0012025331213694436,
+        "max_error_over_bound": 0.04018204781415732
+      },
+      "profile": {
+        "splits": 16,
+        "reload_d576": true,
+        "mma": {
+          "fp8_mma_k": 32,
+          "tile_q": 64,
+          "family": "keeps_mma_ab"
+        }
+      }
+    },
+    {
+      "case": "1,8,64",
+      "arm": "k32",
+      "median_us": 16.560499999999998,
+      "min_us": 16.384,
+      "max_us": 18.337,
+      "samples_ms": [
+        0.018337,
+        0.016608,
+        0.016384,
+        0.016545,
+        0.016512,
+        0.016672,
+        0.016384,
+        0.016576,
+        0.016512,
+        0.016608,
+        0.016832,
+        0.016704,
+        0.016672,
+        0.016608,
+        0.016512,
+        0.016544,
+        0.0168,
+        0.016448,
+        0.016544,
+        0.016736,
+        0.01664,
+        0.01664,
+        0.016512,
+        0.016448,
+        0.016544,
+        0.016705,
+        0.016672,
+        0.016448,
+        0.01648,
+        0.016416
+      ],
+      "workspace_bytes": 8423424,
+      "setup_seconds": 0.1269759300048463,
+      "correctness": {
+        "max_abs_error": 0.0013043735471675267,
+        "max_error_over_bound": 0.04376264047241577
+      },
+      "profile": {
+        "splits": 16,
+        "reload_d576": true,
+        "mma": {
+          "fp8_mma_k": 32,
+          "tile_q": 64,
+          "family": "keeps_mma_ab"
+        }
+      }
+    }
+  ]
+}

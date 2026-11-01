@@ -792,6 +792,37 @@ def select_sparse_mla_d576_split(
     return split, d576_v_split(num_ctas * split, sm_count)
 
 
+def select_sparse_mla_rubin_split(num_ctas, sparse_mla_top_k, sm_count):
+    """Rubin's qualified tiny D576 grid; other geometries keep the baseline."""
+    if sm_count == 212 and sparse_mla_top_k == 2048 and num_ctas <= 2:
+        # One 128-key tile per split shortens the producer, while four V
+        # owners keep the 64/128-CTA grid within one Rubin wave. At four
+        # head tiles this needs two waves and regresses, so keep the cutoff.
+        # SM107 H64 B1/B2 and H128 B1: 8.42/8.61/8.96 -> 7.68/7.94/8.16 us.
+        return 16, 4
+    return select_sparse_mla_d576_split(num_ctas, sparse_mla_top_k, sm_count)
+
+
+def refine_sparse_mla_rubin_profile(profile, *, rows, capacity, sm_count):
+    """Use one extra retained stage in a qualified sustained native FP8 grid."""
+    if (
+        sm_count == 212
+        and rows >= 8 * sm_count
+        and capacity == 2048
+        and profile.family == "keep"
+        and profile.scheduler == "clc"
+        and profile.gather_issue_warps == 8
+        and profile.reuse_kv
+        and profile.reuse_kv_stages == 10
+        and profile.uniform_offset_cache
+    ):
+        # D576 needs five slices per K tile. Stage eleven lets the producer
+        # prefetch beyond two retained tiles and still fits SM107 SMEM.
+        # H64, 8192 queries / top-k 2048: about 1000 -> 930 us.
+        return replace(profile, reuse_kv_stages=11)
+    return profile
+
+
 def prefer_sparse_d576_reload(
     *, rows, heads, query_length, capacity, sm_count, general_profile
 ):

@@ -50,6 +50,7 @@ from ...helpers.math import (
     mma_k_step_for_qkv,
     mma_kind_for_qkv,
     qkv_dtype,
+    qkv_instr_desc,
     qkv_smem_swizzle,
 )
 from ...helpers.ops import (
@@ -206,7 +207,8 @@ class TmemOResource(MlaResource):
     ):
         """Issue PV MMA with P sourced from SMEM and O accumulated in TMEM."""
         cfg = self.cfg
-        idesc = cprims.Tcgen05InstrDesc.build(
+        idesc = qkv_instr_desc(
+            cfg,
             c_dtype=Float32,
             a_dtype=qkv_dtype(cfg),
             b_dtype=qkv_dtype(cfg),
@@ -235,13 +237,15 @@ class TmemOResource(MlaResource):
                 )
                 scale_d = Boolean(True)
                 if cutlass.const_expr(k_block + 1 < k_block_count):
-                    v_desc = v_desc + Int32(256 if cfg.is_fp8_qkv() else 128)
+                    v_desc = v_desc + Int32(8 * mma_k_step)
                     if cutlass.const_expr((k_block + 1) % k_blocks_per_smem_row == 0):
                         p_desc = p_desc.advance_start_address(
                             Int32(q_p_desc_k_block_wrap_bytes(cfg))
                         )
                     else:
-                        p_desc = p_desc.advance_start_address(Int32(16 * 2))
+                        p_desc = p_desc.advance_start_address(
+                            Int32(mma_k_step * cfg.qkv_dtype_bytes)
+                        )
 
     @producer_work
     @cute.jit
@@ -428,7 +432,8 @@ class TmemOResource(MlaResource):
         )
         if cutlass.const_expr(cfg.head_dim_per_cta_v > 256):
             p_addr = tcgen05_panel_addr(p_addr, v_stage_idx // 2)
-        idesc = cprims.Tcgen05InstrDesc.build(
+        idesc = qkv_instr_desc(
+            cfg,
             c_dtype=Float32,
             a_dtype=qkv_dtype(cfg),
             b_dtype=qkv_dtype(cfg),
@@ -455,8 +460,10 @@ class TmemOResource(MlaResource):
                 if cutlass.const_expr(
                     k_block + 1 < cfg.tile_size_kv // mma_k_step_for_qkv(cfg)
                 ):
-                    p_addr = p_addr + Int32(8)
-                    v_desc = v_desc + Int32(256 if cfg.is_fp8_qkv() else 128)
+                    p_addr = p_addr + Int32(
+                        mma_k_step_for_qkv(cfg) * cfg.qkv_dtype_bytes // 4
+                    )
+                    v_desc = v_desc + Int32(8 * mma_k_step_for_qkv(cfg))
 
     @consumer_work(
         returns=(o_stage_idx, tail_o_stage_idx_0, tail_o_stage_idx_1),

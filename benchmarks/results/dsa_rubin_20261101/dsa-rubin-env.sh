@@ -1,0 +1,12 @@
+export CUDA_HOME=/tmp/dsa-rubin-venv/lib/python3.12/site-packages/nvidia/cu13
+export CUDA_PATH="$CUDA_HOME"
+export CUDA_TOOLKIT_PATH="$CUDA_HOME"
+export PATH="/tmp/dsa-rubin-venv/bin:$CUDA_HOME/bin:/usr/bin:/bin"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib:/usr/lib/aarch64-linux-gnu"
+export CC=/usr/bin/gcc
+export CXX=/usr/bin/g++
+export CUDAHOSTCXX=/usr/bin/g++
+export FLASHINFER_WORKSPACE_BASE=/tmp/dsa-rubin-cache
+export CUTE_DSL_ARCH=sm_107a
+export FLASHINFER_CUDA_ARCH_LIST=10.7a
+export CUDA_VISIBLE_DEVICES=0

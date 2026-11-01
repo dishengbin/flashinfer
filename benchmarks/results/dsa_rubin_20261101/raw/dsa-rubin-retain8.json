@@ -1,0 +1,127 @@
+{
+  "commit": "64c816a749996c80ceff3cf6d92e3670890e8b4d",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA Graphics Device', major=10, minor=7, total_memory=285227MB, multi_processor_count=212, uuid=ad47b47f-5e2b-5296-b35e-671d2c53c877, pci_bus_id=129, pci_device_id=0, pci_domain_id=10, L2_cache_size=126MB)",
+  "torch": "2.11.0+cu130",
+  "cuda": "13.0",
+  "cutlass": "4.8.1",
+  "timer": "CUPTI, CUDA graph, explicit cold L2",
+  "pool": 131072,
+  "cache_format": "native",
+  "topk": 2048,
+  "fp8_mma_k": 32,
+  "split_kv_override": null,
+  "forced_family": "keep",
+  "gather_warps": 8,
+  "v_split_override": null,
+  "reuse_kv_override": true,
+  "results": [
+    {
+      "case": "96,1,64",
+      "arm": "k32",
+      "median_us": 32.017,
+      "min_us": 31.871999999999996,
+      "max_us": 32.961,
+      "samples_ms": [
+        0.032961,
+        0.032161,
+        0.032256,
+        0.032256,
+        0.032352,
+        0.031969,
+        0.031873,
+        0.031905,
+        0.032,
+        0.032096,
+        0.031872,
+        0.031969,
+        0.032001,
+        0.032065,
+        0.032097,
+        0.031936,
+        0.031967,
+        0.031936,
+        0.032097,
+        0.032321,
+        0.032352,
+        0.032416,
+        0.032224,
+        0.032033,
+        0.031969,
+        0.031905,
+        0.031969,
+        0.03216,
+        0.031968,
+        0.031904
+      ],
+      "workspace_bytes": 24576,
+      "setup_seconds": 37.5510999779799,
+      "correctness": {
+        "max_abs_error": 0.001323005181435983,
+        "max_error_over_bound": 0.04480528517899401
+      },
+      "profile": {
+        "splits": 1,
+        "reload_d576": false,
+        "mma": {
+          "fp8_mma_k": 32,
+          "tile_q": 64,
+          "family": "keeps_mma_ab"
+        }
+      }
+    },
+    {
+      "case": "1,8192,64",
+      "arm": "k32",
+      "median_us": 1101.8735,
+      "min_us": 1100.465,
+      "max_us": 1108.4650000000001,
+      "samples_ms": [
+        1.108465,
+        1.101777,
+        1.102226,
+        1.102,
+        1.102801,
+        1.101842,
+        1.102833,
+        1.101649,
+        1.101682,
+        1.101521,
+        1.101873,
+        1.102034,
+        1.102289,
+        1.101264,
+        1.102546,
+        1.101392,
+        1.101649,
+        1.102482,
+        1.102865,
+        1.101297,
+        1.101874,
+        1.101713,
+        1.101649,
+        1.102802,
+        1.102417,
+        1.100465,
+        1.10229,
+        1.101425,
+        1.101841,
+        1.102353
+      ],
+      "workspace_bytes": 2097152,
+      "setup_seconds": 0.16605901694856584,
+      "correctness": {
+        "max_abs_error": 0.001507490770993854,
+        "max_error_over_bound": 0.05030250695539671
+      },
+      "profile": {
+        "splits": 1,
+        "reload_d576": false,
+        "mma": {
+          "fp8_mma_k": 32,
+          "tile_q": 64,
+          "family": "keeps_mma_ab"
+        }
+      }
+    }
+  ]
+}

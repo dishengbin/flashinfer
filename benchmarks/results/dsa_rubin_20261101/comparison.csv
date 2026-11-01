@@ -1,0 +1,10 @@
+kind,format,case,baseline_us,optimized_us,speedup,latency_reduction_pct,gpu_uuid,baseline_file,optimized_file
+decode,native,"1,1,64",8.4645,7.7285,1.095231933751698,8.695138519699908,352e0149-f60f-555b-bd86-311eb9bc25d8,raw/dsa-rubin-final-baseline.json,raw/dsa-rubin-final-optimized-repeat.json
+decode,native,"2,1,64",8.607999999999999,7.936,1.0846774193548385,7.806691449814118,cb1efba9-673a-5464-bd4b-419902f6aa1d,raw/dsa-rubin-verify-A.json,raw/dsa-rubin-verify-B.json
+decode,native,"1,1,128",8.959999999999999,8.16,1.0980392156862744,8.92857142857142,cb1efba9-673a-5464-bd4b-419902f6aa1d,raw/dsa-rubin-verify-A.json,raw/dsa-rubin-verify-B.json
+prefill,native,"1,8192,24",924.079,855.87,1.0796955145057077,7.381295322153192,352e0149-f60f-555b-bd86-311eb9bc25d8,raw/dsa-rubin-stage-baseline-h24-h48.json,raw/dsa-rubin-stage11-h24-h48.json
+prefill,native,"1,8192,48",974.801,903.4865000000001,1.0789325573763415,7.3158008660229035,352e0149-f60f-555b-bd86-311eb9bc25d8,raw/dsa-rubin-stage-baseline-h24-h48.json,raw/dsa-rubin-stage11-h24-h48.json
+prefill,native,"1,8192,64",1000.9445000000002,931.711,1.0743079130760507,6.916817066280911,352e0149-f60f-555b-bd86-311eb9bc25d8,raw/dsa-rubin-final-baseline.json,raw/dsa-rubin-final-optimized-repeat.json
+K64 experiment,native,"1,1,16",9.216000000000001,9.121,1.0104155246135293,1.030815972222232,ad47b47f-5e2b-5296-b35e-671d2c53c877,raw/dsa-rubin-fp8-k32-cold.json,raw/dsa-rubin-fp8-k64.json
+K64 experiment,native,"1,8192,16",788.2370000000001,775.9485,1.015836746897507,1.558985432046467,ad47b47f-5e2b-5296-b35e-671d2c53c877,raw/dsa-rubin-fp8-k32-cold.json,raw/dsa-rubin-fp8-k64.json
+K64 experiment,nvfp4.fp8rope,"1,1,16",10.527999999999999,10.496,1.0030487804878048,0.3039513677811412,cb1efba9-673a-5464-bd4b-419902f6aa1d,raw/dsa-rubin-baseline-nvfp4.json,raw/dsa-rubin-nvfp4-k64.json

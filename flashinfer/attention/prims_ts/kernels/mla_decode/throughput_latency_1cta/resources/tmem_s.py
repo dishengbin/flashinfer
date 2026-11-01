@@ -41,8 +41,6 @@ from ...helpers.constants import (
     SCORE_TOKENS_PER_QK_GROUP,
     SMEM_WORD_BYTES,
     TCGEN05_16X256B_SHAPE,
-    TCGEN05_DESC_NEXT_K_BLOCK_UNITS,
-    TCGEN05_DESC_WRAPPED_K_BLOCK_UNITS,
     WARP_LANES,
     WARPGROUP_THREADS,
     WARPGROUP_WARPS,
@@ -71,6 +69,7 @@ from ...helpers.math import (
     mma_kind_for_qkv,
     neg_max_f32,
     qkv_dtype,
+    qkv_instr_desc,
     smem_atomic_max_u32,
     u32_to_float_for_atomic_max,
 )
@@ -369,7 +368,8 @@ class TmemSResource(MlaResource):
             Float32,
         )
         if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
-            idesc = prims.Tcgen05InstrDesc.build(
+            idesc = qkv_instr_desc(
+                cfg,
                 c_dtype=Float32,
                 a_dtype=qkv_dtype(cfg),
                 b_dtype=qkv_dtype(cfg),
@@ -377,7 +377,8 @@ class TmemSResource(MlaResource):
                 m_dim=cfg.tile_size_q,
             )
         else:
-            idesc = prims.Tcgen05InstrDesc.build(
+            idesc = qkv_instr_desc(
+                cfg,
                 c_dtype=Float32,
                 a_dtype=qkv_dtype(cfg),
                 b_dtype=qkv_dtype(cfg),
@@ -385,6 +386,8 @@ class TmemSResource(MlaResource):
                 m_dim=cfg.tile_size_kv,
             )
         k_block_count = cfg.qk_head_stage_width(qk_stage_idx) // mma_k_step_for_qkv(cfg)
+        k_step_units = mma_k_step_for_qkv(cfg) * cfg.qkv_dtype_bytes // 16
+        k_blocks_per_row = 8 // k_step_units
         if prims.elect_sync():
             scale_d = Boolean(qk_stage_idx != 0)
             for k_block in cutlass.range_constexpr(k_block_count):
@@ -430,19 +433,17 @@ class TmemSResource(MlaResource):
                     )
                 scale_d = Boolean(True)
                 if cutlass.const_expr(k_block + 1 < k_block_count):
-                    if cutlass.const_expr(k_block == 3):
+                    if cutlass.const_expr(k_block == k_blocks_per_row - 1):
                         kv_desc = kv_desc + Int32(
-                            cfg.tile_size_kv * 8 - 6
-                            if cfg.tile_size_kv != 128
-                            else TCGEN05_DESC_WRAPPED_K_BLOCK_UNITS
+                            cfg.tile_size_kv * 8 - (k_blocks_per_row - 1) * k_step_units
                         )
                         q_desc = q_desc + Int32(q_p_desc_k_block_wrap_units(cfg))
                     else:
-                        kv_desc = kv_desc + Int32(TCGEN05_DESC_NEXT_K_BLOCK_UNITS)
+                        kv_desc = kv_desc + Int32(k_step_units)
                         q_desc = q_desc + Int32(
-                            8
+                            mma_k_step_for_qkv(cfg) // 4
                             if cfg.q_nope_tmem and qk_stage_idx < 4
-                            else TCGEN05_DESC_NEXT_K_BLOCK_UNITS
+                            else k_step_units
                         )
 
     @consumer_work(returns=(old_max_arr, sum_arr, new_max_arr, local_sum_arr, s_arr))

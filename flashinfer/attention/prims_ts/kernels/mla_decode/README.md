@@ -51,7 +51,7 @@ normalization dimension differs from the absorbed query width.
 
 | Feature | Support |
 |---|---|
-| GPU families | SM100/SM103 Blackwell; NVFP4 paths qualified locally on GB300 |
+| GPU families | SM100/SM103 Blackwell; D576 sparse native FP8 and NVFP4 smoke/performance coverage on SM107 Rubin |
 | Query shape | Fixed `[B,Sq,H,D]` or packed `[total_q,H,D]` with query offsets |
 | Query heads | Native automatic policy admits supported positive counts; NVFP4 qualification covers H8/H16/H32/H64/H128 |
 | Dense cache pages | 16, 32, 64 or 128 tokens; dense or bottom-right causal masking |
@@ -80,6 +80,22 @@ The 1CTA persistent/CLC scheduler requires `split_kv=1`: its work queue does
 not enumerate KV splits. Whole-tile K/V reuse can still run with split-KV using
 a nonpersistent schedule. Low-level profile overrides must obey this constraint;
 2CTA scheduling has its own split-aware work queue.
+
+On the qualified 212-SM Rubin, native D576/top-k 2048 decode with at most two
+64-head work tiles uses sixteen KV splits and four V partitions. This remains
+within one device wave; larger grids keep the Blackwell schedule. Sustained
+native FP8 Keep-AB/CLC grids with eight gather warps retain eleven stages,
+allowing one D128 slice to prefetch beyond two complete D576 tiles. Packed
+caches, extra pools, sinks and valid-prefix specializations retain their
+existing policies.
+
+`benchmarks/bench_dsa_rubin.py` compares the Blackwell policy
+(`--blackwell-policy`) with Rubin defaults and research overrides using CUPTI
+and explicit cold L2. Its FP8 K64 experiment is opt-in: K64 requires full
+datapath MMA, so M64/1CTA, M128/2CTA and WS schedules keep K32. The measured
+K64 gain was small; default MMA precision/step remains unchanged. See
+`benchmarks/results/dsa_rubin_20261101/README.md` for shapes, absolute times,
+the software stack and numerical/graph validation.
 
 Quantized H16/H32 plans retain whole converted K/V tiles for small grids too.
 Below half an SM wave, a nonpersistent power-of-two KV split fills one wave

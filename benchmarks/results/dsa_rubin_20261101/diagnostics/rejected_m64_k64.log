@@ -1,0 +1,21 @@
+{"commit": "64c816a749996c80ceff3cf6d92e3670890e8b4d", "gpu": "_CudaDeviceProperties(name='NVIDIA Graphics Device', major=10, minor=7, total_memory=285227MB, multi_processor_count=212, uuid=352e0149-f60f-555b-bd86-311eb9bc25d8, pci_bus_id=129, pci_device_id=0, pci_domain_id=2, L2_cache_size=126MB)", "torch": "2.11.0+cu130", "cuda": "13.0", "cutlass": "4.8.1", "timer": "CUDA graph/events, rotated inputs, cold L2", "pool": 131072, "cache_format": "native", "topk": 2048, "fp8_mma_k": 64, "split_kv_override": null}
+/tmp/dsa-rubin-source/benchmarks/bench_dsa_rubin.py:155: ExperimentalWarning: 'BatchSparseMLADecodePagedTSWrapper.__init__' is an experimental FlashInfer API: it provides no compatibility guarantees and may change or be removed without deprecation.
+  w = BatchSparseMLADecodePagedTSWrapper()
+2026-11-01 10:37:13,366 - INFO - cute_dsl_core.py:191 - flashinfer.jit: Invalidating stale CuTe-DSL module prims_ts_mla_decode_sm107a_cute_dsl
+2026-11-01 10:37:13,366 - INFO - cute_dsl_core.py:194 - flashinfer.jit: Compiling CuTe-DSL kernel prims_ts_mla_decode_sm107a_cute_dsl/main_sm107_80a62e8aae6de541b90d2244c836048acb52472590e7f96730833fc08ffb5678
+2026-11-01 10:37:45,681 - INFO - cute_dsl_core.py:285 - flashinfer.jit: Persisted CuTe-DSL kernel to /tmp/dsa-rubin-cache/.cache/flashinfer/0.0.0+unknown/107a/cached_ops/prims_ts_mla_decode_sm107a_cute_dsl/main_sm107_80a62e8aae6de541b90d2244c836048acb52472590e7f96730833fc08ffb5678.o
+/tmp/dsa-rubin-source/benchmarks/bench_dsa_rubin.py:170: ExperimentalWarning: 'BatchSparseMLADecodePagedTSWrapper.run' is an experimental FlashInfer API: it provides no compatibility guarantees and may change or be removed without deprecation.
+  w.run(
+Traceback (most recent call last):
+  File "/tmp/dsa-rubin-source/benchmarks/bench_dsa_rubin.py", line 215, in <module>
+    main()
+  File "/tmp/dsa-rubin-source/benchmarks/bench_dsa_rubin.py", line 182, in main
+    torch.cuda.synchronize()
+  File "/tmp/dsa-rubin-venv/lib/python3.12/site-packages/torch/cuda/__init__.py", line 1162, in synchronize
+    return torch._C._cuda_synchronize()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.AcceleratorError: CUDA error: an illegal instruction was encountered
+Search for `cudaErrorIllegalInstruction' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.

@@ -1,7 +1,8 @@
 # Experimental Task-Scheduled Attention
 
 `flashinfer.attention.prims_ts` exposes experimental CuTe DSL attention
-kernels for NVIDIA Blackwell GPUs. Scheduling, tile selection, and split-KV
+kernels for NVIDIA Blackwell GPUs, with qualified D576 sparse MLA schedules
+on SM107 Rubin. Scheduling, tile selection, and split-KV
 reduction are implementation details; the public interfaces expose attention
 and cache semantics without tuning knobs.
 

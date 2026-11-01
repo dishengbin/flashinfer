@@ -143,7 +143,20 @@ def mma_kind_for_qkv(cfg):
 
 def mma_k_step_for_qkv(cfg) -> int:
     """Return the K step consumed by one tcgen05 MMA instruction."""
-    return 32 if cfg.is_fp8_qkv() else 16
+    return getattr(cfg, "fp8_mma_k", 32) if cfg.is_fp8_qkv() else 16
+
+
+def qkv_instr_desc(cfg, **kwargs):
+    """Build a descriptor with Rubin's FP8 K64 selector when requested.
+
+    Keep the K32 call compatible with DSL 4.7, whose descriptor builder does
+    not expose k_dim. K64 requires the Rubin-aware DSL 4.8 builder.
+    """
+    if cfg.is_fp8_qkv() and getattr(cfg, "fp8_mma_k", 32) == 64:
+        if kwargs.get("m_dim", 0) < 128:
+            raise ValueError("Rubin FP8 K64 requires full datapath MMA (M128/1CTA)")
+        kwargs["k_dim"] = 1
+    return prims.Tcgen05InstrDesc.build(**kwargs)
 
 
 def qkv_major_k_stride_bytes_for(cfg, head_dim: int) -> int:

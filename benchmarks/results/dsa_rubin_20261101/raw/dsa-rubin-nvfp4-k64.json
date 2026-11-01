@@ -1,0 +1,73 @@
+{
+  "commit": "64c816a749996c80ceff3cf6d92e3670890e8b4d",
+  "gpu": "_CudaDeviceProperties(name='NVIDIA Graphics Device', major=10, minor=7, total_memory=285227MB, multi_processor_count=212, uuid=cb1efba9-673a-5464-bd4b-419902f6aa1d, pci_bus_id=225, pci_device_id=0, pci_domain_id=10, L2_cache_size=126MB)",
+  "torch": "2.11.0+cu130",
+  "cuda": "13.0",
+  "cutlass": "4.8.1",
+  "timer": "CUPTI, CUDA graph, explicit cold L2",
+  "pool": 131072,
+  "cache_format": "nvfp4.fp8rope",
+  "topk": 2048,
+  "fp8_mma_k": 64,
+  "split_kv_override": null,
+  "forced_family": null,
+  "gather_warps": 4,
+  "v_split_override": null,
+  "reuse_kv_override": null,
+  "results": [
+    {
+      "case": "1,1,16",
+      "arm": "k64",
+      "median_us": 10.496,
+      "min_us": 10.368,
+      "max_us": 11.393,
+      "samples_ms": [
+        0.011393,
+        0.010529,
+        0.010497,
+        0.01056,
+        0.01056,
+        0.010848,
+        0.010368,
+        0.0104,
+        0.010497,
+        0.010497,
+        0.010496,
+        0.01072,
+        0.010624,
+        0.010432,
+        0.010368,
+        0.010401,
+        0.0104,
+        0.010464,
+        0.010496,
+        0.010624,
+        0.010496,
+        0.010528,
+        0.010465,
+        0.010496,
+        0.010432,
+        0.010496,
+        0.010592,
+        0.010464,
+        0.010465,
+        0.010592
+      ],
+      "workspace_bytes": 131648,
+      "setup_seconds": 26.50555862003239,
+      "correctness": {
+        "max_abs_error": 0.0007956184120352034,
+        "max_error_over_bound": 0.045702826724574
+      },
+      "profile": {
+        "splits": 8,
+        "reload_d576": false,
+        "mma": {
+          "fp8_mma_k": 64,
+          "tile_q": 16,
+          "family": "swaps_mma_ab"
+        }
+      }
+    }
+  ]
+}
